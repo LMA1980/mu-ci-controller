@@ -1719,10 +1719,7 @@ pub fn extract_cd_service_name(manifest_yaml: &str, repo_name: &str) -> String {
         .to_string()
 }
 
-/// Resolves the `MuConDe` CD API bearer token from an explicit file path or literal/file environment value.
-/// Fails closed (`None`) if a configured file path cannot be read or is empty.
-#[must_use]
-pub fn load_cd_api_token_from_values(
+fn load_secret_from_values(
     token_file: Option<&str>,
     token_literal_or_path: Option<&str>,
 ) -> Option<String> {
@@ -1747,6 +1744,16 @@ pub fn load_cd_api_token_from_values(
     None
 }
 
+/// Resolves the `MuConDe` CD API bearer token from an explicit file path or literal/file environment value.
+/// Fails closed (`None`) if a configured file path cannot be read or is empty.
+#[must_use]
+pub fn load_cd_api_token_from_values(
+    token_file: Option<&str>,
+    token_literal_or_path: Option<&str>,
+) -> Option<String> {
+    load_secret_from_values(token_file, token_literal_or_path)
+}
+
 /// Loads the `MuConDe` CD API bearer token from `MUCONDE_CD_API_TOKEN_FILE` or `MUCONDE_CD_API_TOKEN`.
 #[must_use]
 pub fn load_cd_api_token() -> Option<String> {
@@ -1755,26 +1762,1044 @@ pub fn load_cd_api_token() -> Option<String> {
     load_cd_api_token_from_values(token_file.as_deref(), token_val.as_deref())
 }
 
+/// Resolves a `MuRegist` bearer token from an explicit file path or literal/file value.
+/// Fails closed (`None`) if a configured file path cannot be read or is empty.
+#[must_use]
+pub fn load_registry_api_token_from_values(
+    token_file: Option<&str>,
+    token_literal_or_path: Option<&str>,
+) -> Option<String> {
+    load_secret_from_values(token_file, token_literal_or_path)
+}
+
+fn resolve_env_secret_pairs(pairs: &[(&str, &str)]) -> Result<Option<String>, String> {
+    for (value_var, file_var) in pairs {
+        let file_val = std::env::var(file_var).ok();
+        let literal_val = std::env::var(value_var).ok();
+        let has_file = file_val.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let has_literal = literal_val.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if has_file || has_literal {
+            return load_registry_api_token_from_values(
+                file_val.as_deref(),
+                literal_val.as_deref(),
+            )
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "Configured registry token environment variable ({value_var}/{file_var}) could not be read or is empty"
+                )
+            });
+        }
+    }
+    Ok(None)
+}
+
+/// Loads the `MuRegist` bearer token from `MUREGIST_API_TOKEN*`, `MUREGIST_TOKEN*`, or `MUCONDE_REGISTRY_TOKEN*`.
+#[must_use]
+pub fn load_registry_api_token() -> Option<String> {
+    resolve_env_secret_pairs(&[
+        ("MUREGIST_API_TOKEN", "MUREGIST_API_TOKEN_FILE"),
+        ("MUREGIST_TOKEN", "MUREGIST_TOKEN_FILE"),
+        ("MUCONDE_REGISTRY_TOKEN", "MUCONDE_REGISTRY_TOKEN_FILE"),
+    ])
+    .ok()
+    .flatten()
+}
+
+fn first_non_empty_env(vars: &[&str]) -> Option<String> {
+    for var in vars {
+        if let Ok(raw) = std::env::var(var) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Endpoint, authentication, and mTLS configuration for post-CI bundle upload and rollout dispatch.
+#[derive(Debug, Clone, Default)]
+pub struct PostCiCdEndpointConfig<'a> {
+    pub muregist_api_url: Option<&'a str>,
+    pub muregist_api_token: Option<&'a str>,
+    pub muregist_client_cert_san: Option<&'a str>,
+    pub tls_ca_path: Option<&'a str>,
+    pub tls_cert_path: Option<&'a str>,
+    pub tls_key_path: Option<&'a str>,
+    pub muconde_cd_api_url: Option<&'a str>,
+    pub cd_api_token: Option<&'a str>,
+}
+
+mod post_ci_cd {
+    use super::extract_cd_service_name;
+    use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::path::{Component, Path, PathBuf};
+    use std::time::Duration;
+    use tar::{Archive, Builder, EntryType, Header};
+
+    #[derive(Debug, Default, Deserialize)]
+    struct RawCdManifest {
+        #[serde(default)]
+        target_nodes: Vec<String>,
+        #[serde(default)]
+        deployment: RawCdDeployment,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct RawCdDeployment {
+        binary: Option<String>,
+        install_path: Option<String>,
+        web_root: Option<String>,
+        artifact: Option<String>,
+        #[serde(default)]
+        target_nodes: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct CdManifestSummary {
+        pub(super) service_name: String,
+        pub(super) binary: Option<String>,
+        pub(super) install_path: Option<String>,
+        pub(super) web_root: Option<String>,
+        pub(super) artifact: Option<String>,
+        pub(super) target_nodes: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum ExpectedElfArch {
+        X86_64,
+        Riscv64,
+        Aarch64,
+    }
+
+    impl ExpectedElfArch {
+        const fn e_machine(self) -> u16 {
+            match self {
+                Self::X86_64 => 0x003E,
+                Self::Riscv64 => 0x00F3,
+                Self::Aarch64 => 0x00B7,
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::X86_64 => "x86_64",
+                Self::Riscv64 => "riscv64",
+                Self::Aarch64 => "aarch64",
+            }
+        }
+
+        const fn target_triple(self) -> &'static str {
+            match self {
+                Self::X86_64 => "x86_64-unknown-linux-gnu",
+                Self::Riscv64 => "riscv64gc-unknown-linux-gnu",
+                Self::Aarch64 => "aarch64-unknown-linux-gnu",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct PackagedArtifact {
+        pub(super) filename: String,
+        pub(super) bytes: Vec<u8>,
+        pub(super) sha256_hex: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CanaryBundleUploadResponse {
+        bundle_id: Option<String>,
+        service_name: Option<String>,
+        binary_digest: String,
+        it_archive_digest: String,
+    }
+
+    fn clean_opt(value: Option<String>) -> Option<String> {
+        value.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
+    pub(super) fn parse_cd_manifest_summary(
+        manifest_yaml: &str,
+        repo_name: &str,
+    ) -> CdManifestSummary {
+        let service_name = extract_cd_service_name(manifest_yaml, repo_name);
+        let parsed = serde_yaml::from_str::<RawCdManifest>(manifest_yaml).unwrap_or_default();
+        let target_nodes = if !parsed.deployment.target_nodes.is_empty() {
+            parsed.deployment.target_nodes
+        } else {
+            parsed.target_nodes
+        };
+        CdManifestSummary {
+            service_name,
+            binary: clean_opt(parsed.deployment.binary),
+            install_path: clean_opt(parsed.deployment.install_path),
+            web_root: clean_opt(parsed.deployment.web_root),
+            artifact: clean_opt(parsed.deployment.artifact),
+            target_nodes,
+        }
+    }
+
+    pub(super) fn compute_sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    pub(super) fn infer_target_arch_from_nodes(target_nodes: &[String]) -> Option<ExpectedElfArch> {
+        let mut detected = HashSet::new();
+        for raw_node in target_nodes {
+            let node = raw_node.trim().to_ascii_lowercase();
+            if node.is_empty() {
+                continue;
+            }
+            if node.contains("riscv64") || node.contains("riscv") {
+                detected.insert(ExpectedElfArch::Riscv64);
+            } else if node.contains("aarch64") || node.contains("arm64") {
+                detected.insert(ExpectedElfArch::Aarch64);
+            } else if node.contains("x86_64") || node.contains("amd64") {
+                detected.insert(ExpectedElfArch::X86_64);
+            } else {
+                // Generic host aliases (e.g., node-a / node-b) do not pin a single ISA.
+                return None;
+            }
+        }
+        if detected.len() == 1 {
+            detected.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    fn parse_elf_machine(bytes: &[u8]) -> Option<(u8, u16)> {
+        if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+            return None;
+        }
+        let ei_class = bytes[4];
+        let ei_data = bytes[5];
+        let e_machine = match ei_data {
+            1 => u16::from_le_bytes([bytes[18], bytes[19]]),
+            2 => u16::from_be_bytes([bytes[18], bytes[19]]),
+            _ => return None,
+        };
+        Some((ei_class, e_machine))
+    }
+
+    pub(super) fn validate_elf_architecture(
+        bytes: &[u8],
+        expected: Option<ExpectedElfArch>,
+        artifact_path: &Path,
+    ) -> Result<(), String> {
+        let Some(arch) = expected else {
+            return Ok(());
+        };
+        let Some((ei_class, e_machine)) = parse_elf_machine(bytes) else {
+            return Ok(());
+        };
+        if ei_class != 2 || e_machine != arch.e_machine() {
+            return Err(format!(
+                "Artifact '{}' ELF target (class={}, e_machine=0x{e_machine:04x}) does not match target_nodes architecture {} (0x{:04x})",
+                artifact_path.display(),
+                ei_class,
+                arch.label(),
+                arch.e_machine()
+            ));
+        }
+        Ok(())
+    }
+
+    fn sanitize_relative_subpath(raw: &str) -> Result<PathBuf, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('\0') {
+            return Err("Artifact subpath must not be empty or contain NUL bytes".to_string());
+        }
+        let mut clean = PathBuf::new();
+        for comp in Path::new(trimmed).components() {
+            match comp {
+                Component::Normal(part) => clean.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(format!(
+                        "Artifact subpath '{trimmed}' contains disallowed path traversal or root component"
+                    ));
+                }
+            }
+        }
+        if clean.as_os_str().is_empty() {
+            return Err(format!(
+                "Artifact subpath '{trimmed}' resolves to repository root"
+            ));
+        }
+        Ok(clean)
+    }
+
+    fn collect_sorted_files(
+        root: &Path,
+        current: &Path,
+        out: &mut Vec<PathBuf>,
+    ) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(current)
+            .map_err(|e| format!("Failed to list '{}': {e}", current.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read entry in '{}': {e}", current.display()))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to package symlink '{}' into release bundle",
+                    path.display()
+                ));
+            }
+            if meta.is_dir() {
+                collect_sorted_files(root, &path, out)?;
+            } else if meta.is_file() {
+                let rel = path.strip_prefix(root).map_err(|e| {
+                    format!(
+                        "Failed to relativize '{}' against '{}': {e}",
+                        path.display(),
+                        root.display()
+                    )
+                })?;
+                out.push(rel.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    fn append_tar_file(
+        builder: &mut Builder<GzEncoder<Vec<u8>>>,
+        archive_path: &Path,
+        contents: &[u8],
+        mode: u32,
+    ) -> Result<(), String> {
+        let mut header = Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, archive_path, contents)
+            .map_err(|e| {
+                format!(
+                    "Failed to append archive entry '{}': {e}",
+                    archive_path.display()
+                )
+            })
+    }
+
+    fn is_executable_file(path: &Path, force_exec_sh: bool) -> bool {
+        if force_exec_sh
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+        {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                return (meta.permissions().mode() & 0o111) != 0;
+            }
+        }
+        false
+    }
+
+    fn package_directory_tar_gz(
+        source_dir: &Path,
+        archive_prefix: Option<&str>,
+        force_exec_sh: bool,
+    ) -> Result<(Vec<u8>, usize), String> {
+        let mut rel_files = Vec::new();
+        collect_sorted_files(source_dir, source_dir, &mut rel_files)?;
+        if rel_files.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        for rel in &rel_files {
+            let full_path = source_dir.join(rel);
+            let bytes = std::fs::read(&full_path)
+                .map_err(|e| format!("Failed to read '{}': {e}", full_path.display()))?;
+            let archive_path = match archive_prefix {
+                Some(prefix) => Path::new(prefix).join(rel),
+                None => rel.clone(),
+            };
+            let mode = if is_executable_file(&full_path, force_exec_sh) {
+                0o755
+            } else {
+                0o644
+            };
+            append_tar_file(&mut builder, &archive_path, &bytes, mode)?;
+        }
+
+        let file_count = rel_files.len();
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finalize tar stream: {e}"))?;
+        let encoder = builder
+            .into_inner()
+            .map_err(|e| format!("Failed to unwrap tar encoder: {e}"))?;
+        let gz_bytes = encoder
+            .finish()
+            .map_err(|e| format!("Failed to finalize gzip archive: {e}"))?;
+        Ok((gz_bytes, file_count))
+    }
+
+    fn validate_prebuilt_tar_gz(bytes: &[u8], artifact_path: &Path) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Err(format!(
+                "Prebuilt archive '{}' is empty",
+                artifact_path.display()
+            ));
+        }
+        let mut archive = Archive::new(GzDecoder::new(bytes));
+        let entries = archive.entries().map_err(|e| {
+            format!(
+                "Invalid gzip tar archive '{}': {e}",
+                artifact_path.display()
+            )
+        })?;
+        let mut regular_files = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "Corrupt entry in archive '{}': {e}",
+                    artifact_path.display()
+                )
+            })?;
+            let entry_type = entry.header().entry_type();
+            if matches!(entry_type, EntryType::Symlink | EntryType::Link) {
+                return Err(format!(
+                    "Archive '{}' contains disallowed symlink or hardlink",
+                    artifact_path.display()
+                ));
+            }
+            let rel = entry
+                .path()
+                .map_err(|e| format!("Invalid entry path in '{}': {e}", artifact_path.display()))?;
+            if rel.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            }) {
+                return Err(format!(
+                    "Archive '{}' contains unsafe path '{}'",
+                    artifact_path.display(),
+                    rel.display()
+                ));
+            }
+            if entry_type.is_file() {
+                regular_files += 1;
+            }
+        }
+        if regular_files == 0 {
+            return Err(format!(
+                "Archive '{}' contains no regular files",
+                artifact_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_static_web_service_name(service_name: &str) -> bool {
+        let canonical = service_name.trim().to_ascii_lowercase().replace('_', "-");
+        matches!(
+            canonical.as_str(),
+            "muconsole" | "mu-console" | "action-runner-web" | "mu-ci-web"
+        )
+    }
+
+    fn is_static_web_deployment(summary: &CdManifestSummary) -> bool {
+        if is_static_web_service_name(&summary.service_name) || summary.web_root.is_some() {
+            return true;
+        }
+        summary.artifact.as_deref().is_some_and(|raw| {
+            let trimmed = raw.trim().trim_end_matches('/');
+            trimmed == "dist"
+                || trimmed == "./dist"
+                || trimmed.ends_with(".tar.gz")
+                || trimmed.ends_with(".tgz")
+        })
+    }
+
+    fn resolve_static_web_bundle(
+        repo_workspace: &Path,
+        summary: &CdManifestSummary,
+    ) -> Result<PackagedArtifact, String> {
+        let sub_rel = match summary.artifact.as_deref() {
+            Some(art) => sanitize_relative_subpath(art)?,
+            None => PathBuf::from("dist"),
+        };
+        let target_path = repo_workspace.join(&sub_rel);
+        let meta = std::fs::symlink_metadata(&target_path).map_err(|e| {
+            format!(
+                "Static web bundle source '{}' not found: {e}",
+                target_path.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Static web bundle source '{}' must not be a symlink",
+                target_path.display()
+            ));
+        }
+
+        let bytes = if meta.is_file() {
+            let raw = std::fs::read(&target_path)
+                .map_err(|e| format!("Failed to read '{}': {e}", target_path.display()))?;
+            validate_prebuilt_tar_gz(&raw, &target_path)?;
+            raw
+        } else if meta.is_dir() {
+            let (gz_bytes, file_count) =
+                package_directory_tar_gz(&target_path, Some("dist"), false)?;
+            if file_count == 0 {
+                return Err(format!(
+                    "Static web bundle directory '{}' contains no regular files",
+                    target_path.display()
+                ));
+            }
+            gz_bytes
+        } else {
+            return Err(format!(
+                "Static web bundle source '{}' is neither a regular file nor directory",
+                target_path.display()
+            ));
+        };
+
+        let sha256_hex = compute_sha256_hex(&bytes);
+        let filename = format!("{}-dist.tar.gz", summary.service_name);
+        Ok(PackagedArtifact {
+            filename,
+            bytes,
+            sha256_hex,
+        })
+    }
+
+    fn canonical_public_binary_candidates(name: &str) -> &'static [&'static str] {
+        let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "action-runner" | "action-runner-worker" | "mu-ci-worker" => {
+                &["mu-ci-worker", "action-runner"]
+            }
+            "action-runner-controller" | "mu-ci-controller" => {
+                &["mu-ci-controller", "action-runner-controller"]
+            }
+            "muregist" | "mu-registry" => &["mu-registry", "muregist"],
+            "muconde-agent" | "mu-cd-agent" => &["mu-cd-agent", "muconde-agent"],
+            "muconde-controller" | "mu-cd-controller" => {
+                &["mu-cd-controller", "muconde-controller"]
+            }
+            "muobserve" | "muobservectl" | "mu-observable-hub" => {
+                &["mu-observable-hub", "muobservectl", "muobserve"]
+            }
+            "muobserve-collector" | "mu-observable-collector" => {
+                &["mu-observable-collector", "muobserve-collector"]
+            }
+            "muobserve-sentinel" | "mu-observable-sentinel" => {
+                &["mu-observable-sentinel", "muobserve-sentinel"]
+            }
+            "k3-manager" | "jero-manager" => &["k3-manager", "jero-manager"],
+            _ => &[],
+        }
+    }
+
+    fn push_unique_name(out: &mut Vec<String>, candidate: &str) {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    fn candidate_binary_names(summary: &CdManifestSummary, repo_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(bin) = summary.binary.as_deref() {
+            push_unique_name(&mut names, bin);
+            for alias in canonical_public_binary_candidates(bin) {
+                push_unique_name(&mut names, alias);
+            }
+        }
+        for alias in canonical_public_binary_candidates(&summary.service_name) {
+            push_unique_name(&mut names, alias);
+        }
+        if let Some(install_path) = summary.install_path.as_deref() {
+            if let Some(base) = Path::new(install_path).file_name().and_then(|s| s.to_str()) {
+                push_unique_name(&mut names, base);
+            }
+        }
+        push_unique_name(&mut names, &summary.service_name);
+        push_unique_name(
+            &mut names,
+            &summary.service_name.to_ascii_lowercase().replace('_', "-"),
+        );
+        if let Some(repo_short) = repo_name.rsplit('/').next() {
+            push_unique_name(&mut names, repo_short);
+        }
+        names
+    }
+
+    fn candidate_release_dirs(expected_arch: Option<ExpectedElfArch>) -> Vec<PathBuf> {
+        match expected_arch {
+            Some(arch) => vec![
+                PathBuf::from("target")
+                    .join(arch.target_triple())
+                    .join("release"),
+                PathBuf::from("target/release"),
+            ],
+            None => vec![
+                PathBuf::from("target/release"),
+                PathBuf::from("target")
+                    .join(ExpectedElfArch::Riscv64.target_triple())
+                    .join("release"),
+                PathBuf::from("target")
+                    .join(ExpectedElfArch::X86_64.target_triple())
+                    .join("release"),
+                PathBuf::from("target")
+                    .join(ExpectedElfArch::Aarch64.target_triple())
+                    .join("release"),
+            ],
+        }
+    }
+
+    fn read_validated_binary(
+        path: &Path,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<Option<PackagedArtifact>, String> {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return Ok(None);
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing symlink binary artifact '{}'",
+                path.display()
+            ));
+        }
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read binary artifact '{}': {e}", path.display()))?;
+        if bytes.is_empty() {
+            return Err(format!("Binary artifact '{}' is empty", path.display()));
+        }
+        validate_elf_architecture(&bytes, expected_arch, path)?;
+        let sha256_hex = compute_sha256_hex(&bytes);
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact.bin")
+            .to_string();
+        Ok(Some(PackagedArtifact {
+            filename,
+            bytes,
+            sha256_hex,
+        }))
+    }
+
+    fn resolve_binary_artifact(
+        repo_workspace: &Path,
+        repo_name: &str,
+        summary: &CdManifestSummary,
+    ) -> Result<PackagedArtifact, String> {
+        let expected_arch = infer_target_arch_from_nodes(&summary.target_nodes);
+        let candidates = candidate_binary_names(summary, repo_name);
+
+        if let Some(raw_art) = summary.artifact.as_deref() {
+            let rel_art = sanitize_relative_subpath(art_or_raw(raw_art))?;
+            let art_path = repo_workspace.join(&rel_art);
+            if let Some(pkg) = read_validated_binary(&art_path, expected_arch)? {
+                return Ok(pkg);
+            }
+            if art_path.is_dir() {
+                for bin_name in &candidates {
+                    let candidate_path = art_path.join(bin_name);
+                    if let Some(pkg) = read_validated_binary(&candidate_path, expected_arch)? {
+                        return Ok(pkg);
+                    }
+                }
+            }
+        }
+
+        if let Some(explicit_bin) = summary.binary.as_deref() {
+            if explicit_bin.contains('/') {
+                let rel_bin = sanitize_relative_subpath(explicit_bin)?;
+                let bin_path = repo_workspace.join(&rel_bin);
+                if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
+                    return Ok(pkg);
+                }
+            }
+        }
+
+        for rel_dir in candidate_release_dirs(expected_arch) {
+            let abs_dir = repo_workspace.join(&rel_dir);
+            for bin_name in &candidates {
+                let bin_path = abs_dir.join(bin_name);
+                if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
+                    return Ok(pkg);
+                }
+            }
+        }
+
+        Err(format!(
+            "No release binary found in '{}' matching candidates {:?}",
+            repo_workspace.display(),
+            candidates
+        ))
+    }
+
+    const fn art_or_raw(raw: &str) -> &str {
+        raw
+    }
+
+    pub(super) fn resolve_and_package_artifact(
+        repo_workspace: &Path,
+        repo_name: &str,
+        summary: &CdManifestSummary,
+    ) -> Result<PackagedArtifact, String> {
+        if is_static_web_deployment(summary) {
+            resolve_static_web_bundle(repo_workspace, summary)
+        } else {
+            resolve_binary_artifact(repo_workspace, repo_name, summary)
+        }
+    }
+
+    fn build_fallback_it_manifest_tar_gz(
+        service_name: &str,
+        commit_sha: &str,
+        artifact_sha256: &str,
+    ) -> Result<Vec<u8>, String> {
+        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "service": service_name,
+            "git_commit": commit_sha,
+            "artifact_sha256": artifact_sha256,
+            "tests": [],
+        }))
+        .map_err(|e| format!("Failed to serialize IT manifest JSON: {e}"))?;
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        append_tar_file(
+            &mut builder,
+            Path::new("manifest.json"),
+            &manifest_bytes,
+            0o644,
+        )?;
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finish IT manifest tar archive: {e}"))?;
+        let mut encoder = builder
+            .into_inner()
+            .map_err(|e| format!("Failed to unwrap IT manifest tar builder: {e}"))?;
+        encoder
+            .flush()
+            .map_err(|e| format!("Failed to flush IT manifest gzip stream: {e}"))?;
+        encoder
+            .finish()
+            .map_err(|e| format!("Failed to finish IT manifest gzip stream: {e}"))
+    }
+
+    pub(super) fn package_it_archive(
+        repo_workspace: &Path,
+        summary: &CdManifestSummary,
+        commit_sha: &str,
+        artifact_sha256: &str,
+    ) -> Result<PackagedArtifact, String> {
+        const IT_DIR_CANDIDATES: [&str; 6] = [
+            ".mucd/it",
+            ".mucd/tests",
+            ".muconde/it",
+            ".muconde/tests",
+            "tests/it",
+            "it",
+        ];
+        for rel in IT_DIR_CANDIDATES {
+            let dir_path = repo_workspace.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&dir_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink IT directory '{}'",
+                    dir_path.display()
+                ));
+            }
+            if meta.is_dir() {
+                let (gz_bytes, file_count) = package_directory_tar_gz(&dir_path, None, true)?;
+                if file_count > 0 {
+                    let sha256_hex = compute_sha256_hex(&gz_bytes);
+                    return Ok(PackagedArtifact {
+                        filename: format!("{}-it.tar.gz", summary.service_name),
+                        bytes: gz_bytes,
+                        sha256_hex,
+                    });
+                }
+            }
+        }
+
+        const IT_MANIFEST_FILES: [&str; 3] = [
+            ".mucd/it-manifest.json",
+            ".mucd/manifest.json",
+            "it-manifest.json",
+        ];
+        for rel in IT_MANIFEST_FILES {
+            let file_path = repo_workspace.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&file_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink IT manifest '{}'",
+                    file_path.display()
+                ));
+            }
+            if meta.is_file() {
+                let raw = std::fs::read(&file_path)
+                    .map_err(|e| format!("Failed to read '{}': {e}", file_path.display()))?;
+                let encoder = GzEncoder::new(Vec::new(), Compression::default());
+                let mut builder = Builder::new(encoder);
+                append_tar_file(&mut builder, Path::new("manifest.json"), &raw, 0o644)?;
+                builder
+                    .finish()
+                    .map_err(|e| format!("Failed to finalize IT tar archive: {e}"))?;
+                let gz_bytes = builder
+                    .into_inner()
+                    .map_err(|e| format!("Failed to unwrap IT tar builder: {e}"))?
+                    .finish()
+                    .map_err(|e| format!("Failed to finalize IT gzip archive: {e}"))?;
+                let sha256_hex = compute_sha256_hex(&gz_bytes);
+                return Ok(PackagedArtifact {
+                    filename: format!("{}-it.tar.gz", summary.service_name),
+                    bytes: gz_bytes,
+                    sha256_hex,
+                });
+            }
+        }
+
+        let gz_bytes =
+            build_fallback_it_manifest_tar_gz(&summary.service_name, commit_sha, artifact_sha256)?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(PackagedArtifact {
+            filename: format!("{}-it.tar.gz", summary.service_name),
+            bytes: gz_bytes,
+            sha256_hex,
+        })
+    }
+
+    pub(super) fn build_cd_http_client(
+        tls_ca_path: Option<&str>,
+        tls_cert_path: Option<&str>,
+        tls_key_path: Option<&str>,
+    ) -> Result<(reqwest::Client, Option<String>), String> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+
+        if let Some(ca_path) = tls_ca_path.map(str::trim).filter(|s| !s.is_empty()) {
+            let ca_bytes = std::fs::read(ca_path)
+                .map_err(|e| format!("Failed to read TLS CA bundle '{ca_path}': {e}"))?;
+            let ca_certs = reqwest::Certificate::from_pem_bundle(&ca_bytes)
+                .map_err(|e| format!("Invalid TLS CA bundle '{ca_path}': {e}"))?;
+            for cert in ca_certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        let cert_trimmed = tls_cert_path.map(str::trim).filter(|s| !s.is_empty());
+        let key_trimmed = tls_key_path.map(str::trim).filter(|s| !s.is_empty());
+        let mut derived_san = None;
+
+        match (cert_trimmed, key_trimmed) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_pem = std::fs::read_to_string(cert_path)
+                    .map_err(|e| format!("Failed to read TLS client cert '{cert_path}': {e}"))?;
+                let key_pem = std::fs::read_to_string(key_path)
+                    .map_err(|e| format!("Failed to read TLS client key '{key_path}': {e}"))?;
+                let combined_pem = format!("{cert_pem}\n{key_pem}");
+                let identity =
+                    reqwest::Identity::from_pem(combined_pem.as_bytes()).map_err(|e| {
+                        format!("Invalid TLS client identity ('{cert_path}' / '{key_path}'): {e}")
+                    })?;
+                builder = builder.identity(identity);
+
+                let parsed_certs = crate::tls::load_certs(Path::new(cert_path))
+                    .map_err(|e| format!("Failed to parse TLS client cert '{cert_path}': {e}"))?;
+                if let Some(first_cert) = parsed_certs.first() {
+                    let sans = crate::tls::extract_client_cert_sans(first_cert).map_err(|e| {
+                        format!("Failed to extract SANs from TLS client cert '{cert_path}': {e}")
+                    })?;
+                    derived_san = sans.into_iter().next();
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "Both TLS client certificate path and private key path must be provided together"
+                        .to_string(),
+                );
+            }
+            (None, None) => {}
+        }
+
+        let client = builder
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client for post-CI CD pipeline: {e}"))?;
+        Ok((client, derived_san))
+    }
+
+    pub(super) struct RegistryUploadRequest<'a> {
+        pub(super) client: &'a reqwest::Client,
+        pub(super) reg_base: &'a str,
+        pub(super) service_name: &'a str,
+        pub(super) binary: &'a PackagedArtifact,
+        pub(super) it_archive: &'a PackagedArtifact,
+        pub(super) muregist_api_token: Option<&'a str>,
+        pub(super) client_cert_san: Option<&'a str>,
+        pub(super) traceparent: &'a str,
+    }
+
+    pub(super) async fn upload_it_bundle_to_registry(
+        req_cfg: &RegistryUploadRequest<'_>,
+    ) -> Result<Option<String>, String> {
+        let reg_url = format!(
+            "{}/api/v1/bundles/it",
+            req_cfg.reg_base.trim_end_matches('/')
+        );
+        let binary_part = reqwest::multipart::Part::bytes(req_cfg.binary.bytes.clone())
+            .file_name(req_cfg.binary.filename.clone())
+            .mime_str("application/octet-stream")
+            .map_err(|e| format!("Invalid binary multipart MIME type: {e}"))?;
+        let it_part = reqwest::multipart::Part::bytes(req_cfg.it_archive.bytes.clone())
+            .file_name(req_cfg.it_archive.filename.clone())
+            .mime_str("application/gzip")
+            .map_err(|e| format!("Invalid it_archive multipart MIME type: {e}"))?;
+        let form = reqwest::multipart::Form::new()
+            .text("service_name", req_cfg.service_name.to_string())
+            .part("binary", binary_part)
+            .part("it_archive", it_part);
+
+        let mut req = req_cfg
+            .client
+            .post(&reg_url)
+            .header("traceparent", req_cfg.traceparent)
+            .multipart(form);
+        if let Some(token) = req_cfg
+            .muregist_api_token
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(san) = req_cfg
+            .client_cert_san
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            req = req.header("x-client-cert-san", san);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Failed to contact MuRegist at '{reg_url}': {e}"))?;
+        let status = resp.status();
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed reading MuRegist response body: {e}"))?;
+        if !status.is_success() {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            return Err(format!(
+                "MuRegist returned HTTP {status} for '{reg_url}': {body_text}"
+            ));
+        }
+
+        let record: CanaryBundleUploadResponse =
+            serde_json::from_slice(&body_bytes).map_err(|e| {
+                format!("MuRegist returned invalid JSON bundle record on HTTP {status}: {e}")
+            })?;
+        if record.binary_digest.trim() != req_cfg.binary.sha256_hex {
+            return Err(format!(
+                "MuRegist binary_digest mismatch: expected {}, got {}",
+                req_cfg.binary.sha256_hex,
+                record.binary_digest.trim()
+            ));
+        }
+        if record.it_archive_digest.trim() != req_cfg.it_archive.sha256_hex {
+            return Err(format!(
+                "MuRegist it_archive_digest mismatch: expected {}, got {}",
+                req_cfg.it_archive.sha256_hex,
+                record.it_archive_digest.trim()
+            ));
+        }
+        if let Some(returned_service) = record
+            .service_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if returned_service != req_cfg.service_name {
+                return Err(format!(
+                    "MuRegist service_name mismatch: expected '{}', got '{returned_service}'",
+                    req_cfg.service_name
+                ));
+            }
+        }
+        Ok(clean_opt(record.bundle_id))
+    }
+}
+
 /// Triggers post-CI Continuous Distribution (`MuRegist`) and Continuous Deployment (`MuConDe`)
 /// when a `main` branch `push` or `merge` job succeeds and the repository defines a CD manifest.
 pub async fn trigger_post_ci_cd_pipeline(job: &Job, repo_workspace: &Path) -> bool {
-    let muregist_url = std::env::var("MUREGIST_API_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let muconde_url = std::env::var("MUCONDE_CD_API_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let muregist_url =
+        first_non_empty_env(&["MUREGIST_API_URL", "MUREGIST_URL", "MUCONDE_REGISTRY_URL"]);
+    let muregist_token = match resolve_env_secret_pairs(&[
+        ("MUREGIST_API_TOKEN", "MUREGIST_API_TOKEN_FILE"),
+        ("MUREGIST_TOKEN", "MUREGIST_TOKEN_FILE"),
+        ("MUCONDE_REGISTRY_TOKEN", "MUCONDE_REGISTRY_TOKEN_FILE"),
+    ]) {
+        Ok(tok) => tok,
+        Err(reason) => {
+            warn!(job_id = %job.id, repo = %job.repo_name, error = %reason, "Aborting post-CI CD pipeline due to unreadable registry token");
+            return false;
+        }
+    };
+    let muregist_san =
+        first_non_empty_env(&["MUREGIST_CLIENT_CERT_SAN", "ACTION_RUNNER_CLIENT_CERT_SAN"]);
+    let tls_ca_path = first_non_empty_env(&["MUREGIST_TLS_CA", "ACTION_RUNNER_TLS_CA"]);
+    let tls_cert_path = first_non_empty_env(&["MUREGIST_TLS_CERT", "ACTION_RUNNER_TLS_CERT"]);
+    let tls_key_path = first_non_empty_env(&["MUREGIST_TLS_KEY", "ACTION_RUNNER_TLS_KEY"]);
+    let muconde_url = first_non_empty_env(&["MUCONDE_CD_API_URL"]);
     let cd_token = load_cd_api_token();
-    trigger_post_ci_cd_pipeline_with_endpoints(
-        job,
-        repo_workspace,
-        muregist_url.as_deref(),
-        muconde_url.as_deref(),
-        cd_token.as_deref(),
-    )
-    .await
+
+    let cfg = PostCiCdEndpointConfig {
+        muregist_api_url: muregist_url.as_deref(),
+        muregist_api_token: muregist_token.as_deref(),
+        muregist_client_cert_san: muregist_san.as_deref(),
+        tls_ca_path: tls_ca_path.as_deref(),
+        tls_cert_path: tls_cert_path.as_deref(),
+        tls_key_path: tls_key_path.as_deref(),
+        muconde_cd_api_url: muconde_url.as_deref(),
+        cd_api_token: cd_token.as_deref(),
+    };
+    trigger_post_ci_cd_pipeline_with_config(job, repo_workspace, &cfg).await
 }
 
 /// Testable implementation of post-CI `MuRegist` bundle registration and `MuConDe` rollout dispatch.
@@ -1785,6 +2810,21 @@ pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
     muconde_cd_api_url: Option<&str>,
     cd_api_token: Option<&str>,
 ) -> bool {
+    let cfg = PostCiCdEndpointConfig {
+        muregist_api_url,
+        muconde_cd_api_url,
+        cd_api_token,
+        ..Default::default()
+    };
+    trigger_post_ci_cd_pipeline_with_config(job, repo_workspace, &cfg).await
+}
+
+/// Configurable post-CI `MuRegist` multipart CAS upload and `MuConDe` rollout dispatch.
+pub async fn trigger_post_ci_cd_pipeline_with_config(
+    job: &Job,
+    repo_workspace: &Path,
+    endpoints: &PostCiCdEndpointConfig<'_>,
+) -> bool {
     if !is_main_push_or_merge(job) {
         return false;
     }
@@ -1794,67 +2834,128 @@ pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
         None => return false,
     };
 
-    let service_name = extract_cd_service_name(&manifest_yaml, &job.repo_name);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Failed to build HTTP client for post-CI CD pipeline");
+    let reg_base = endpoints
+        .muregist_api_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cd_base = endpoints
+        .muconde_cd_api_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if reg_base.is_none() && cd_base.is_none() {
+        return false;
+    }
+
+    let summary = post_ci_cd::parse_cd_manifest_summary(&manifest_yaml, &job.repo_name);
+    let (client, cert_san) = match post_ci_cd::build_cd_http_client(
+        endpoints.tls_ca_path,
+        endpoints.tls_cert_path,
+        endpoints.tls_key_path,
+    ) {
+        Ok(res) => res,
+        Err(reason) => {
+            warn!(job_id = %job.id, repo = %job.repo_name, error = %reason, "Failed to initialize post-CI CD HTTP client");
             return false;
         }
     };
 
-    if let Some(reg_base) = muregist_api_url.map(str::trim).filter(|s| !s.is_empty()) {
-        let reg_url = format!("{}/api/v1/bundles/it", reg_base.trim_end_matches('/'));
-        let reg_payload = serde_json::json!({
-            "service_name": service_name,
-            "binary_digest": job.commit_sha,
-            "it_archive_digest": job.commit_sha,
-            "bundle_digest": job.commit_sha,
-            "git_commit": job.commit_sha,
-        });
-        match client
-            .post(&reg_url)
-            .header("x-client-cert-san", "mu-ci-controller")
-            .json(&reg_payload)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
+    let effective_san = endpoints
+        .muregist_client_cert_san
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or(cert_san);
+
+    let workspace = repo_workspace.to_path_buf();
+    let repo_name = job.repo_name.clone();
+    let commit_sha = job.commit_sha.clone();
+    let summary_for_pack = summary.clone();
+    let packaged = tokio::task::spawn_blocking(move || {
+        let binary =
+            post_ci_cd::resolve_and_package_artifact(&workspace, &repo_name, &summary_for_pack)?;
+        let it_archive = post_ci_cd::package_it_archive(
+            &workspace,
+            &summary_for_pack,
+            &commit_sha,
+            &binary.sha256_hex,
+        )?;
+        Ok::<_, String>((binary, it_archive))
+    })
+    .await;
+
+    let (binary, it_archive) = match packaged {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(reason)) => {
+            warn!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                service = %summary.service_name,
+                error = %reason,
+                "Failed to resolve or package post-CI CD release artifacts; aborting rollout"
+            );
+            return false;
+        }
+        Err(join_err) => {
+            warn!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                error = %join_err,
+                "Artifact packaging task panicked; aborting rollout"
+            );
+            return false;
+        }
+    };
+
+    let traceparent = crate::storage_backend::job_root_traceparent(&job.id, &job.commit_sha);
+    let mut bundle_id = None;
+
+    if let Some(reg_url_base) = reg_base {
+        let upload_req = post_ci_cd::RegistryUploadRequest {
+            client: &client,
+            reg_base: reg_url_base,
+            service_name: &summary.service_name,
+            binary: &binary,
+            it_archive: &it_archive,
+            muregist_api_token: endpoints.muregist_api_token,
+            client_cert_san: effective_san.as_deref(),
+            traceparent: &traceparent,
+        };
+        match post_ci_cd::upload_it_bundle_to_registry(&upload_req).await {
+            Ok(uploaded_id) => {
+                bundle_id = uploaded_id;
                 info!(
                     job_id = %job.id,
                     repo = %job.repo_name,
-                    service = %service_name,
+                    service = %summary.service_name,
                     commit = %job.commit_sha,
-                    "Registered post-CI artifact bundle in MuRegist"
+                    binary_digest = %binary.sha256_hex,
+                    it_archive_digest = %it_archive.sha256_hex,
+                    bundle_id = ?bundle_id,
+                    "Uploaded and verified post-CI artifact bundle in MuRegist CAS"
                 );
             }
-            Ok(resp) => {
+            Err(reason) => {
                 warn!(
                     job_id = %job.id,
                     repo = %job.repo_name,
-                    status = %resp.status(),
-                    "MuRegist bundle registration returned non-success status"
+                    service = %summary.service_name,
+                    error = %reason,
+                    "MuRegist multipart CAS bundle upload failed; aborting CD rollout dispatch"
                 );
-            }
-            Err(e) => {
-                warn!(
-                    job_id = %job.id,
-                    repo = %job.repo_name,
-                    error = %e,
-                    "Failed to contact MuRegist for post-CI bundle registration"
-                );
+                return false;
             }
         }
     }
 
-    let cd_base = match muconde_cd_api_url.map(str::trim).filter(|s| !s.is_empty()) {
+    let cd_url_base = match cd_base {
         Some(u) => u,
         None => return false,
     };
-    let token = match cd_api_token.map(str::trim).filter(|s| !s.is_empty()) {
+    let token = match endpoints
+        .cd_api_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(t) => t,
         None => {
             warn!(
@@ -1866,17 +2967,24 @@ pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
         }
     };
 
-    let deploy_url = format!("{}/api/cd/deploy", cd_base.trim_end_matches('/'));
-    let deploy_payload = serde_json::json!({
+    let deploy_url = format!("{}/api/cd/deploy", cd_url_base.trim_end_matches('/'));
+    let mut deploy_payload = serde_json::json!({
         "repo": job.repo_name,
-        "artifact_sha256": job.commit_sha,
+        "artifact_sha256": binary.sha256_hex,
+        "git_commit": job.commit_sha,
+        "binary_digest": binary.sha256_hex,
+        "it_archive_digest": it_archive.sha256_hex,
         "manifest_yaml": manifest_yaml,
         "wait": false,
     });
+    if let Some(id) = bundle_id.as_deref() {
+        deploy_payload["bundle_id"] = serde_json::Value::String(id.to_string());
+    }
 
     match client
         .post(&deploy_url)
         .header("Authorization", format!("Bearer {token}"))
+        .header("traceparent", &traceparent)
         .json(&deploy_payload)
         .send()
         .await
@@ -1885,8 +2993,9 @@ pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
             info!(
                 job_id = %job.id,
                 repo = %job.repo_name,
-                service = %service_name,
+                service = %summary.service_name,
                 commit = %job.commit_sha,
+                artifact_sha256 = %binary.sha256_hex,
                 "Triggered post-CI MuConDe rollout deployment"
             );
             true
@@ -2478,10 +3587,84 @@ on_action:
         );
     }
 
+    #[cfg(test)]
+    fn parse_multipart_parts(
+        content_type: &str,
+        body: &[u8],
+    ) -> HashMap<String, (Option<String>, Vec<u8>)> {
+        let boundary = content_type
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("boundary="))
+            .map(|b| b.trim_matches('"'))
+            .expect("multipart content-type missing boundary");
+        let delimiter = format!("--{boundary}").into_bytes();
+        let mut parts = HashMap::new();
+        let mut pos = 0usize;
+
+        while let Some(rel_start) = body[pos..]
+            .windows(delimiter.len())
+            .position(|w| w == delimiter.as_slice())
+        {
+            pos += rel_start + delimiter.len();
+            if body[pos..].starts_with(b"--") {
+                break;
+            }
+            if body[pos..].starts_with(b"\r\n") {
+                pos += 2;
+            }
+            let Some(header_end) = body[pos..].windows(4).position(|w| w == b"\r\n\r\n") else {
+                break;
+            };
+            let header_str = std::str::from_utf8(&body[pos..pos + header_end]).unwrap();
+            pos += header_end + 4;
+            let next_boundary = body[pos..]
+                .windows(delimiter.len())
+                .position(|w| w == delimiter.as_slice())
+                .expect("unterminated multipart part");
+            let mut part_bytes = body[pos..pos + next_boundary].to_vec();
+            if part_bytes.ends_with(b"\r\n") {
+                part_bytes.truncate(part_bytes.len() - 2);
+            }
+            pos += next_boundary;
+
+            let mut field_name = None;
+            let mut filename = None;
+            for line in header_str.split("\r\n") {
+                if let Some(disp) = line
+                    .strip_prefix("Content-Disposition:")
+                    .or_else(|| line.strip_prefix("content-disposition:"))
+                {
+                    for param in disp.split(';') {
+                        let p = param.trim();
+                        if let Some(val) = p.strip_prefix("name=") {
+                            field_name = Some(val.trim_matches('"').to_string());
+                        } else if let Some(val) = p.strip_prefix("filename=") {
+                            filename = Some(val.trim_matches('"').to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(name) = field_name {
+                parts.insert(name, (filename, part_bytes));
+            }
+        }
+        parts
+    }
+
+    fn make_test_elf_header(e_machine: u16) -> Vec<u8> {
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELF64
+        elf[5] = 1; // Little endian
+        elf[6] = 1; // EV_CURRENT
+        elf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        elf
+    }
+
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_trigger_post_ci_cd_pipeline_registers_bundle_and_dispatches_deploy() {
-        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Json, Router};
         use std::sync::Mutex;
 
         let dir = tempdir().unwrap();
@@ -2491,23 +3674,57 @@ on_action:
             "version: \"1\"\nservice: \"muconsole\"\ntarget_nodes:\n  - \"node-a\"\n  - \"node-b\"\n";
         std::fs::write(muconde_dir.join("MuConDe.yml"), manifest_content).unwrap();
 
-        let captured: Arc<Mutex<Vec<(String, String, serde_json::Value)>>> =
+        let dist_dir = dir.path().join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(dist_dir.join("index.html"), b"<html>muconsole</html>").unwrap();
+        std::fs::write(dist_dir.join("app.wasm"), b"\x00asm\x01\x00\x00\x00").unwrap();
+
+        type MultipartPartsMap = HashMap<String, (Option<String>, Vec<u8>)>;
+        type CapturedRegCall = (String, MultipartPartsMap);
+        let captured_reg: Arc<Mutex<Vec<CapturedRegCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_deploy: Arc<Mutex<Vec<(String, String, serde_json::Value)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
         let app = Router::new()
             .route(
                 "/api/v1/bundles/it",
                 post({
-                    let cap = captured.clone();
-                    move |Json(body): Json<serde_json::Value>| {
+                    let cap = captured_reg.clone();
+                    move |headers: HeaderMap, body: Bytes| {
                         let cap = cap.clone();
                         async move {
-                            cap.lock().unwrap().push((
-                                "/api/v1/bundles/it".to_string(),
-                                String::new(),
-                                body,
-                            ));
-                            axum::http::StatusCode::CREATED
+                            let content_type = headers
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let traceparent = headers
+                                .get("traceparent")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let parts = parse_multipart_parts(&content_type, &body);
+                            let service_name = String::from_utf8(
+                                parts.get("service_name").expect("service_name").1.clone(),
+                            )
+                            .unwrap();
+                            let binary_digest = post_ci_cd::compute_sha256_hex(
+                                &parts.get("binary").expect("binary").1,
+                            );
+                            let it_archive_digest = post_ci_cd::compute_sha256_hex(
+                                &parts.get("it_archive").expect("it_archive").1,
+                            );
+                            cap.lock().unwrap().push((traceparent, parts));
+                            (
+                                axum::http::StatusCode::CREATED,
+                                Json(serde_json::json!({
+                                    "bundle_id": "bundle-static-001",
+                                    "service_name": service_name,
+                                    "binary_digest": binary_digest,
+                                    "it_archive_digest": it_archive_digest,
+                                    "status": "pending_it",
+                                })),
+                            )
                         }
                     }
                 }),
@@ -2515,7 +3732,7 @@ on_action:
             .route(
                 "/api/cd/deploy",
                 post({
-                    let cap = captured.clone();
+                    let cap = captured_deploy.clone();
                     move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
                         let cap = cap.clone();
                         async move {
@@ -2524,9 +3741,12 @@ on_action:
                                 .and_then(|v| v.to_str().ok())
                                 .unwrap_or("")
                                 .to_string();
-                            cap.lock()
-                                .unwrap()
-                                .push(("/api/cd/deploy".to_string(), auth, body));
+                            let tp = headers
+                                .get("traceparent")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            cap.lock().unwrap().push((auth, tp, body));
                             axum::http::StatusCode::ACCEPTED
                         }
                     }
@@ -2563,14 +3783,573 @@ on_action:
         .await;
         assert!(triggered);
 
-        let calls = captured.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "/api/v1/bundles/it");
-        assert_eq!(calls[0].2["service_name"], "muconsole");
-        assert_eq!(calls[0].2["git_commit"], "deadbeefcafe1234");
-        assert_eq!(calls[1].0, "/api/cd/deploy");
-        assert_eq!(calls[1].1, "Bearer test-cd-token");
-        assert_eq!(calls[1].2["repo"], "LMA1980/mu-console");
-        assert_eq!(calls[1].2["artifact_sha256"], "deadbeefcafe1234");
+        let reg_calls = captured_reg.lock().unwrap().clone();
+        assert_eq!(reg_calls.len(), 1);
+        assert!(reg_calls[0].0.starts_with("00-"));
+        let parts = &reg_calls[0].1;
+        assert_eq!(parts["service_name"].1, b"muconsole");
+
+        let binary_part = &parts["binary"];
+        assert!(binary_part
+            .0
+            .as_deref()
+            .is_some_and(|n| n.ends_with(".tar.gz")));
+        let expected_bin_sha = post_ci_cd::compute_sha256_hex(&binary_part.1);
+        let expected_it_sha = post_ci_cd::compute_sha256_hex(&parts["it_archive"].1);
+
+        let mut tar_entries = Vec::new();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(binary_part.1.as_slice()));
+        for entry in archive.entries().unwrap() {
+            tar_entries.push(entry.unwrap().path().unwrap().display().to_string());
+        }
+        assert!(tar_entries.contains(&"dist/index.html".to_string()));
+        assert!(tar_entries.contains(&"dist/app.wasm".to_string()));
+
+        let mut it_entries = Vec::new();
+        let mut it_archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            parts["it_archive"].1.as_slice(),
+        ));
+        for entry in it_archive.entries().unwrap() {
+            it_entries.push(entry.unwrap().path().unwrap().display().to_string());
+        }
+        assert_eq!(it_entries, vec!["manifest.json".to_string()]);
+
+        let deploy_calls = captured_deploy.lock().unwrap().clone();
+        assert_eq!(deploy_calls.len(), 1);
+        assert_eq!(deploy_calls[0].0, "Bearer test-cd-token");
+        assert_eq!(deploy_calls[0].1, reg_calls[0].0);
+        let deploy_body = &deploy_calls[0].2;
+        assert_eq!(deploy_body["repo"], "LMA1980/mu-console");
+        assert_eq!(deploy_body["artifact_sha256"], expected_bin_sha);
+        assert_ne!(deploy_body["artifact_sha256"], "deadbeefcafe1234");
+        assert_eq!(deploy_body["git_commit"], "deadbeefcafe1234");
+        assert_eq!(deploy_body["binary_digest"], expected_bin_sha);
+        assert_eq!(deploy_body["it_archive_digest"], expected_it_sha);
+        assert_eq!(deploy_body["bundle_id"], "bundle-static-001");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_binary_with_registry_auth_and_it_dir() {
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Json, Router};
+        use std::sync::Mutex;
+
+        let dir = tempdir().unwrap();
+        let mucd_dir = dir.path().join(".mucd");
+        let it_dir = mucd_dir.join("it");
+        let release_dir = dir.path().join("target/release");
+        std::fs::create_dir_all(&it_dir).unwrap();
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        let manifest_content = concat!(
+            "version: \"1\"\n",
+            "service: \"action-runner-controller\"\n",
+            "target_nodes:\n",
+            "  - \"node-a\"\n",
+            "deployment:\n",
+            "  binary: \"custom-ci-bin\"\n",
+            "  install_path: \"/usr/local/bin/mu-ci-controller\"\n",
+        );
+        std::fs::write(mucd_dir.join("mu-cd.yml"), manifest_content).unwrap();
+        std::fs::write(it_dir.join("smoke.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let custom_bin_bytes = b"\x7fELF-custom-ci-binary-payload-v1".to_vec();
+        std::fs::write(release_dir.join("custom-ci-bin"), &custom_bin_bytes).unwrap();
+        std::fs::write(release_dir.join("mu-ci-controller"), b"secondary-binary").unwrap();
+
+        #[derive(Clone)]
+        struct CapturedAuthCall {
+            auth: String,
+            san: String,
+            service_name: String,
+            bin_bytes: Vec<u8>,
+            it_bytes: Vec<u8>,
+        }
+        let reg_headers: Arc<Mutex<Vec<CapturedAuthCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let deploy_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/bundles/it",
+                post({
+                    let cap = reg_headers.clone();
+                    move |headers: HeaderMap, body: Bytes| {
+                        let cap = cap.clone();
+                        async move {
+                            let ct = headers
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let san = headers
+                                .get("x-client-cert-san")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let parts = parse_multipart_parts(ct, &body);
+                            let service_name =
+                                String::from_utf8(parts["service_name"].1.clone()).unwrap();
+                            let bin_bytes = parts["binary"].1.clone();
+                            let it_bytes = parts["it_archive"].1.clone();
+                            let bin_sha = post_ci_cd::compute_sha256_hex(&bin_bytes);
+                            let it_sha = post_ci_cd::compute_sha256_hex(&it_bytes);
+                            cap.lock().unwrap().push(CapturedAuthCall {
+                                auth,
+                                san,
+                                service_name: service_name.clone(),
+                                bin_bytes,
+                                it_bytes,
+                            });
+                            (
+                                axum::http::StatusCode::CREATED,
+                                Json(serde_json::json!({
+                                    "bundle_id": "bundle-bin-002",
+                                    "service_name": service_name,
+                                    "binary_digest": bin_sha,
+                                    "it_archive_digest": it_sha,
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/cd/deploy",
+                post({
+                    let cap = deploy_bodies.clone();
+                    move |Json(body): Json<serde_json::Value>| {
+                        let cap = cap.clone();
+                        async move {
+                            cap.lock().unwrap().push(body);
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let job = Job {
+            id: "job-cd-bin".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+            commit_sha: "abc123def456".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        let cfg = PostCiCdEndpointConfig {
+            muregist_api_url: Some(&base_url),
+            muregist_api_token: Some("reg-secret-token"),
+            muregist_client_cert_san: Some("ci-controller.example.test"),
+            muconde_cd_api_url: Some(&base_url),
+            cd_api_token: Some("cd-secret-token"),
+            ..Default::default()
+        };
+
+        assert!(trigger_post_ci_cd_pipeline_with_config(&job, dir.path(), &cfg).await);
+
+        let captured = reg_headers.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].auth, "Bearer reg-secret-token");
+        assert_eq!(captured[0].san, "ci-controller.example.test");
+        assert_eq!(captured[0].service_name, "action-runner-controller");
+        assert_eq!(captured[0].bin_bytes, custom_bin_bytes);
+
+        let mut it_archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            captured[0].it_bytes.as_slice(),
+        ));
+        let mut saw_smoke = false;
+        for entry in it_archive.entries().unwrap() {
+            let e = entry.unwrap();
+            if e.path().unwrap().to_str() == Some("smoke.sh") {
+                assert_eq!(e.header().mode().unwrap() & 0o777, 0o755);
+                saw_smoke = true;
+            }
+        }
+        assert!(saw_smoke);
+
+        let deploys = deploy_bodies.lock().unwrap().clone();
+        assert_eq!(deploys.len(), 1);
+        let expected_sha = post_ci_cd::compute_sha256_hex(&custom_bin_bytes);
+        assert_eq!(deploys[0]["artifact_sha256"], expected_sha);
+        assert_eq!(deploys[0]["git_commit"], "abc123def456");
+        assert_ne!(deploys[0]["artifact_sha256"], deploys[0]["git_commit"]);
+        assert_eq!(deploys[0]["bundle_id"], "bundle-bin-002");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_canonical_mu_binary_wins_over_legacy() {
+        let dir = tempdir().unwrap();
+        let mucd_dir = dir.path().join(".mucd");
+        let release_dir = dir.path().join("target/release");
+        std::fs::create_dir_all(&mucd_dir).unwrap();
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(
+            mucd_dir.join("mu-cd.yml"),
+            "version: \"1\"\nservice: \"action-runner-controller\"\n",
+        )
+        .unwrap();
+        std::fs::write(release_dir.join("mu-ci-controller"), b"canonical-mu-bin").unwrap();
+        std::fs::write(
+            release_dir.join("action-runner-controller"),
+            b"legacy-alias-bin",
+        )
+        .unwrap();
+
+        let summary = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"action-runner-controller\"\n",
+            "LMA1980/mu-ci-controller",
+        );
+        let resolved = post_ci_cd::resolve_and_package_artifact(
+            dir.path(),
+            "LMA1980/mu-ci-controller",
+            &summary,
+        )
+        .unwrap();
+        assert_eq!(resolved.filename, "mu-ci-controller");
+        assert_eq!(resolved.bytes, b"canonical-mu-bin");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_fails_closed_on_registry_error_or_digest_mismatch() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for mode in ["http-500", "digest-mismatch"] {
+            let dir = tempdir().unwrap();
+            let mucd_dir = dir.path().join(".mucd");
+            let release_dir = dir.path().join("target/release");
+            std::fs::create_dir_all(&mucd_dir).unwrap();
+            std::fs::create_dir_all(&release_dir).unwrap();
+            std::fs::write(
+                mucd_dir.join("mu-cd.yml"),
+                "version: \"1\"\nservice: \"mu-ci-controller\"\n",
+            )
+            .unwrap();
+            std::fs::write(release_dir.join("mu-ci-controller"), b"valid-binary-bytes").unwrap();
+
+            let deploy_count = Arc::new(AtomicUsize::new(0));
+            let mode_owned = mode.to_string();
+            let app = Router::new()
+                .route(
+                    "/api/v1/bundles/it",
+                    post({
+                        move || {
+                            let mode_inner = mode_owned.clone();
+                            async move {
+                                if mode_inner == "http-500" {
+                                    (
+                                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(serde_json::json!({ "error": "cas down" })),
+                                    )
+                                } else {
+                                    (
+                                        axum::http::StatusCode::CREATED,
+                                        Json(serde_json::json!({
+                                            "bundle_id": "bad-bundle",
+                                            "service_name": "mu-ci-controller",
+                                            "binary_digest": "0".repeat(64),
+                                            "it_archive_digest": "0".repeat(64),
+                                        })),
+                                    )
+                                }
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/api/cd/deploy",
+                    post({
+                        let count = deploy_count.clone();
+                        move || {
+                            let count = count.clone();
+                            async move {
+                                count.fetch_add(1, Ordering::SeqCst);
+                                axum::http::StatusCode::ACCEPTED
+                            }
+                        }
+                    }),
+                )
+                .with_state(());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let base_url = format!("http://{addr}");
+
+            let job = Job {
+                id: format!("job-fail-{mode}"),
+                event_type: "push".to_string(),
+                repo_name: "LMA1980/mu-ci-controller".to_string(),
+                clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+                commit_sha: "feedface1234".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                sender: "LMA1980".to_string(),
+                pr_number: None,
+                queued_at: Utc::now(),
+            };
+
+            let ok = trigger_post_ci_cd_pipeline_with_endpoints(
+                &job,
+                dir.path(),
+                Some(&base_url),
+                Some(&base_url),
+                Some("cd-token"),
+            )
+            .await;
+            assert!(!ok, "expected fail-closed false for mode {mode}");
+            assert_eq!(deploy_count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_fails_closed_on_missing_or_cross_arch_artifact() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir_missing = tempdir().unwrap();
+        let mucd_missing = dir_missing.path().join(".mucd");
+        std::fs::create_dir_all(&mucd_missing).unwrap();
+        std::fs::write(
+            mucd_missing.join("mu-cd.yml"),
+            "version: \"1\"\nservice: \"mu-ci-controller\"\n",
+        )
+        .unwrap();
+
+        let dir_xarch = tempdir().unwrap();
+        let mucd_xarch = dir_xarch.path().join(".mucd");
+        let release_xarch = dir_xarch.path().join("target/release");
+        std::fs::create_dir_all(&mucd_xarch).unwrap();
+        std::fs::create_dir_all(&release_xarch).unwrap();
+        std::fs::write(
+            mucd_xarch.join("mu-cd.yml"),
+            "version: \"1\"\nservice: \"mu-cd-agent\"\ntarget_nodes:\n  - \"worker-riscv64\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            release_xarch.join("mu-cd-agent"),
+            make_test_elf_header(0x003E),
+        )
+        .unwrap();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v1/bundles/it",
+                post({
+                    let hits = hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            axum::http::StatusCode::CREATED
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/cd/deploy",
+                post({
+                    let hits = hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let job = Job {
+            id: "job-xarch".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-cd-agent".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-cd-agent.git".to_string(),
+            commit_sha: "cafebabe9999".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        assert!(
+            !trigger_post_ci_cd_pipeline_with_endpoints(
+                &job,
+                dir_missing.path(),
+                Some(&base_url),
+                Some(&base_url),
+                Some("cd-token"),
+            )
+            .await
+        );
+        assert!(
+            !trigger_post_ci_cd_pipeline_with_endpoints(
+                &job,
+                dir_xarch.path(),
+                Some(&base_url),
+                Some(&base_url),
+                Some("cd-token"),
+            )
+            .await
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let riscv_dir = dir_xarch
+            .path()
+            .join("target/riscv64gc-unknown-linux-gnu/release");
+        std::fs::create_dir_all(&riscv_dir).unwrap();
+        let riscv_elf = make_test_elf_header(0x00F3);
+        std::fs::write(riscv_dir.join("mu-cd-agent"), &riscv_elf).unwrap();
+
+        let summary = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"mu-cd-agent\"\ntarget_nodes:\n  - \"worker-riscv64\"\n",
+            "LMA1980/mu-cd-agent",
+        );
+        let picked = post_ci_cd::resolve_and_package_artifact(
+            dir_xarch.path(),
+            "LMA1980/mu-cd-agent",
+            &summary,
+        )
+        .unwrap();
+        assert_eq!(picked.bytes, riscv_elf);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_build_cd_http_client_mtls_and_fail_closed() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+        let dir = tempdir().unwrap();
+        let kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params =
+            CertificateParams::new(vec!["mu-ci-controller.example.test".to_string()]).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "mu-ci-controller.example.test");
+        params.distinguished_name = dn;
+        let cert = params.self_signed(&kp).unwrap();
+
+        let ca_path = dir.path().join("ca.crt");
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&ca_path, cert.pem()).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, kp.serialize_pem()).unwrap();
+
+        let (_client, san) = post_ci_cd::build_cd_http_client(
+            Some(ca_path.to_str().unwrap()),
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(san.as_deref(), Some("mu-ci-controller.example.test"));
+
+        assert!(post_ci_cd::build_cd_http_client(
+            Some(ca_path.to_str().unwrap()),
+            Some(cert_path.to_str().unwrap()),
+            None,
+        )
+        .is_err());
+
+        let missing_ca = dir.path().join("missing-ca.crt");
+        assert!(
+            post_ci_cd::build_cd_http_client(Some(missing_ca.to_str().unwrap()), None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_load_registry_api_token_from_values_and_fail_closed() {
+        let dir = tempdir().unwrap();
+        let tok_path = dir.path().join("reg-token");
+        std::fs::write(&tok_path, "  registry-secret-123 \n").unwrap();
+
+        assert_eq!(
+            load_registry_api_token_from_values(Some(tok_path.to_str().unwrap()), None).as_deref(),
+            Some("registry-secret-123")
+        );
+        assert_eq!(
+            load_registry_api_token_from_values(None, Some("  inline-reg-tok  ")).as_deref(),
+            Some("inline-reg-tok")
+        );
+        let missing = dir.path().join("does-not-exist");
+        assert_eq!(
+            load_registry_api_token_from_values(Some(missing.to_str().unwrap()), Some("ignored")),
+            None
+        );
+        assert_eq!(
+            load_registry_api_token_from_values(None, Some(missing.to_str().unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_cd_manifest_summary_and_arch_inference() {
+        let yaml = concat!(
+            "version: \"1\"\n",
+            "service: \"mu-cd-agent\"\n",
+            "target_nodes:\n",
+            "  - \"node-a\"\n",
+            "deployment:\n",
+            "  binary: \"mu-cd-agent\"\n",
+            "  install_path: \"/usr/local/bin/mu-cd-agent\"\n",
+            "  target_nodes:\n",
+            "    - \"worker-riscv64\"\n",
+        );
+        let summary = post_ci_cd::parse_cd_manifest_summary(yaml, "LMA1980/mu-cd-agent");
+        assert_eq!(summary.service_name, "mu-cd-agent");
+        assert_eq!(summary.binary.as_deref(), Some("mu-cd-agent"));
+        assert_eq!(
+            summary.install_path.as_deref(),
+            Some("/usr/local/bin/mu-cd-agent")
+        );
+        assert_eq!(summary.target_nodes, vec!["worker-riscv64".to_string()]);
+        assert_eq!(
+            post_ci_cd::infer_target_arch_from_nodes(&summary.target_nodes),
+            Some(post_ci_cd::ExpectedElfArch::Riscv64)
+        );
+        assert_eq!(
+            post_ci_cd::infer_target_arch_from_nodes(&["worker-aarch64".to_string()]),
+            Some(post_ci_cd::ExpectedElfArch::Aarch64)
+        );
+        assert_eq!(
+            post_ci_cd::infer_target_arch_from_nodes(&["node-a".to_string(), "node-b".to_string()]),
+            None
+        );
+        assert_eq!(
+            post_ci_cd::infer_target_arch_from_nodes(&[
+                "worker-riscv64".to_string(),
+                "worker-aarch64".to_string(),
+            ]),
+            None
+        );
     }
 }
