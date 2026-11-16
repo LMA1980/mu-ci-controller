@@ -381,9 +381,13 @@ on_action:
                 s.sha == job_1.commit_sha
                     && s.state == "success"
                     && !s.description.is_empty()
-                    && !s.context.is_empty()
+                    && s.context == "continuous integration"
             }),
-            "k3-ci / CI commit status must conclude success when all non-skipped stages pass"
+            "continuous integration commit status must conclude success when all non-skipped stages pass"
+        );
+        assert!(
+            !statuses.iter().any(|s| s.context == "k3-ci"),
+            "legacy k3-ci status context must not be emitted"
         );
     }
 

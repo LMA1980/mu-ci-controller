@@ -1603,43 +1603,41 @@ pub async fn report_github_commit_status_with_base_url(
         }
     };
 
-    let contexts: &[&str] = if resolved_base_url.contains("api.github.com") {
-        &["continuous integration", "k3-ci"]
-    } else {
-        &["continuous integration"]
-    };
+    let payload = serde_json::json!({
+        "state": state,
+        "target_url": target_url,
+        "description": desc,
+        "context": "continuous integration",
+    });
 
-    for &ctx in contexts {
-        let payload = serde_json::json!({
-            "state": state,
-            "target_url": target_url,
-            "description": desc,
-            "context": ctx,
-        });
-
-        match github_request(&client, reqwest::Method::POST, &url, token)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    info!(repo = %repo, sha = %sha, state = %state, context = %ctx, "Reported commit status to GitHub");
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    warn!(
-                        repo = %repo,
-                        sha = %sha,
-                        status = %status,
-                        body = %body,
-                        "GitHub commit status API responded with error"
-                    );
-                }
+    match github_request(&client, reqwest::Method::POST, &url, token)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                info!(
+                    repo = %repo,
+                    sha = %sha,
+                    state = %state,
+                    context = "continuous integration",
+                    "Reported commit status to GitHub"
+                );
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    repo = %repo,
+                    sha = %sha,
+                    status = %status,
+                    body = %body,
+                    "GitHub commit status API responded with error"
+                );
             }
-            Err(err) => {
-                warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
-            }
+        }
+        Err(err) => {
+            warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
         }
     }
 }
@@ -4351,5 +4349,56 @@ on_action:
             ]),
             None
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_report_github_commit_status_posts_only_continuous_integration() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/repos/LMA1980/example/statuses/{sha}",
+            post({
+                let captured = captured.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        axum::http::StatusCode::CREATED
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        let config = Config {
+            github_token: Some("ghs_mock_token".to_string()),
+            ..Config::default()
+        };
+
+        report_github_commit_status_with_base_url(
+            &base_url,
+            &config,
+            "LMA1980/example",
+            "0123456789abcdef0123456789abcdef01234567",
+            "pending",
+            "ActionRunner distributed pipeline running...",
+            Some("https://hook.lma1980.duckdns.org/web/#/jobs/job-1"),
+        )
+        .await;
+
+        let calls = captured.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected exactly one status POST");
+        assert_eq!(calls[0]["context"], "continuous integration");
+        assert_ne!(calls[0]["context"], "k3-ci");
+        assert_eq!(calls[0]["state"], "pending");
     }
 }
