@@ -65,6 +65,8 @@ pub struct EvaluatedRequestAuth {
     pub passkey_count: u32,
     /// Effective evaluated `PolicyId` strings granted to this request.
     pub active_policies: BTreeSet<String>,
+    /// Public anonymous `PolicyId` strings evaluated from `RoleFolioIndex["anonymous"]`.
+    pub anonymous_policies: BTreeSet<String>,
     /// Whether `__Host-mu_elevated` cookie was valid (or omitted by non-cookie API caller).
     pub cookie_valid_for_elevated: bool,
     /// Sanitized `AuthSessionDto` payload returned by `GET /api/auth/session`.
@@ -122,6 +124,7 @@ impl EvaluatedRequestAuth {
             passkey_enrollment_required,
             passkey_count,
             active_policies,
+            anonymous_policies,
             cookie_valid_for_elevated,
             session_dto,
             canonical_login,
@@ -129,6 +132,9 @@ impl EvaluatedRequestAuth {
         ) = job_store
             .read_platform_auth(|st| {
                 let anon_lockdown = st.is_anonymous_lockdown();
+                let (_, _, anon_eval) = st.evaluate_principal(None, false, now_ms);
+                let anon_policies: BTreeSet<String> =
+                    anon_eval.policies.iter().map(ToString::to_string).collect();
                 let normalized_key = raw_login.as_deref().and_then(normalize_login);
                 let active_user = normalized_key
                     .as_deref()
@@ -170,6 +176,7 @@ impl EvaluatedRequestAuth {
                             false,
                             0,
                             BTreeSet::new(),
+                            anon_policies,
                             false,
                             dto,
                             Some(presented.clone()),
@@ -193,6 +200,7 @@ impl EvaluatedRequestAuth {
                             } else {
                                 policies
                             },
+                            anon_policies,
                             cookie_ok,
                             dto,
                             Some(login.clone()),
@@ -212,6 +220,7 @@ impl EvaluatedRequestAuth {
                             false,
                             0,
                             policies,
+                            anon_policies,
                             false,
                             dto,
                             None,
@@ -227,6 +236,7 @@ impl EvaluatedRequestAuth {
                     false,
                     false,
                     0,
+                    BTreeSet::new(),
                     BTreeSet::new(),
                     false,
                     AuthSessionDto {
@@ -270,6 +280,7 @@ impl EvaluatedRequestAuth {
             passkey_enrollment_required,
             passkey_count,
             active_policies,
+            anonymous_policies,
             cookie_valid_for_elevated,
             session_dto,
         }
@@ -340,6 +351,7 @@ impl EvaluatedRequestAuth {
             passkey_enrollment_required: false,
             passkey_count: 1,
             active_policies: policy_set,
+            anonymous_policies: BTreeSet::new(),
             cookie_valid_for_elevated: true,
             session_dto: dto,
         }
@@ -408,6 +420,9 @@ impl EvaluatedRequestAuth {
             return Some(authorization_denied_response());
         }
         if self.passkey_enrollment_required {
+            if !self.anonymous_lockdown && self.anonymous_policies.contains(policy) {
+                return None;
+            }
             return Some(passkey_enrollment_required_response());
         }
         if self.invite_bound {

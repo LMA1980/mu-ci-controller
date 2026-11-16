@@ -847,9 +847,43 @@ async fn passkey_counters_clone_detection_management_step_up_and_resets() {
     assert_eq!(adm_rst_j["removed_count"], 1);
     assert_eq!(adm_rst_j["passkey_enrollment_required"], true);
 
-    let (st_op_gate, op_gate_j, _, _) = req_full(&app, "GET", "/api/repos", &op_hdrs, None).await;
+    // At 0 Passkeys with !anonymous_lockdown, public CI read routes remain accessible
+    // (sanitized to public repos), while protected operator routes fail closed with
+    // 403 passkey_enrollment_required. Enabling anonymous_lockdown locks public routes too.
+    let (st_op_repos, _, _, _) = req_full(&app, "GET", "/api/repos", &op_hdrs, None).await;
+    assert_eq!(st_op_repos, StatusCode::OK);
+    let (st_op_queue, _, _, _) = req_full(&app, "GET", "/api/queue", &op_hdrs, None).await;
+    assert_eq!(st_op_queue, StatusCode::OK);
+
+    let (st_op_gate, op_gate_j, _, _) =
+        req_full(&app, "GET", "/api/jobs/job-1/log", &op_hdrs, None).await;
     assert_eq!(st_op_gate, StatusCode::FORBIDDEN);
     assert_eq!(op_gate_j["reason_code"], "passkey_enrollment_required");
+
+    let (st_lock_on, _, _, _) = req_full(
+        &app,
+        "PUT",
+        "/api/auth/role-folio-index",
+        &elevated_hdrs,
+        Some(json!({ "anonymous": [] })),
+    )
+    .await;
+    assert_eq!(st_lock_on, StatusCode::OK);
+
+    let (st_op_lock_repos, op_lock_j, _, _) =
+        req_full(&app, "GET", "/api/repos", &op_hdrs, None).await;
+    assert_eq!(st_op_lock_repos, StatusCode::FORBIDDEN);
+    assert_eq!(op_lock_j["reason_code"], "passkey_enrollment_required");
+
+    let (st_lock_off, _, _, _) = req_full(
+        &app,
+        "PUT",
+        "/api/auth/role-folio-index",
+        &elevated_hdrs,
+        Some(json!({ "anonymous": ["folio:system:status", "folio:ci:anon-queue"] })),
+    )
+    .await;
+    assert_eq!(st_lock_off, StatusCode::OK);
 
     let (st_op_sess, op_sess_j, _, _) =
         req_full(&app, "GET", "/api/auth/session", &op_hdrs, None).await;
