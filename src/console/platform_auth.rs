@@ -26,11 +26,12 @@ use crate::auth::{
     activate_server_role_lease, authenticate_edge_github_login, build_webauthn_service,
     current_epoch_ms, datetime_to_epoch_ms, format_elevated_clear_cookie,
     format_elevated_set_cookie, normalize_login, payload_has_forbidden_ttl_fields,
-    sign_baseline_invite_token, sign_elevated_cookie, verify_baseline_invite_token,
-    verify_elevated_cookie, AuthReasonCodeDto, AuthSessionDto, ConsoleSkinDto, CrtFontDto,
-    ElevatedCookieClaims, PendingAuthenticationState, PendingRegistrationState, PlatformAuthState,
-    PlatformInviteRecord, StepUpPurpose, StoredPasskeyRecord, VerifiedStepUpProof,
-    ELEVATED_COOKIE_NAME, STEP_UP_PROOF_TTL_MS,
+    renew_server_role_lease, sign_baseline_invite_token, sign_elevated_cookie,
+    verify_baseline_invite_token, verify_elevated_cookie, AuthReasonCodeDto, AuthSessionDto,
+    ConsoleSkinDto, CrtFontDto, ElevatedCookieClaims, PendingAuthenticationState,
+    PendingRegistrationState, PlatformAuthState, PlatformInviteRecord, StepUpPurpose,
+    StoredPasskeyRecord, VerifiedStepUpProof, ELEVATED_COOKIE_NAME, STEP_UP_PROOF_TTL_MS,
+    SUPER_OPERATOR_ROLE_ID,
 };
 use crate::config::Config;
 use crate::console::api::parse_invite_token;
@@ -251,6 +252,7 @@ impl EvaluatedRequestAuth {
                         anonymous_login_only: true,
                         baseline_role: Some(crate::auth::BASELINE_ROLE_ID.to_string()),
                         bound_roles: Vec::new(),
+                        bound_role_specs: Vec::new(),
                         active_roles: Vec::new(),
                         leases: Vec::new(),
                         active_folios: Vec::new(),
@@ -330,6 +332,7 @@ impl EvaluatedRequestAuth {
             anonymous_login_only: anon_lockdown,
             baseline_role: Some(baseline),
             bound_roles: vec!["admin".to_string()],
+            bound_role_specs: roles.clone(),
             active_roles: roles,
             leases: Vec::new(),
             active_folios: all_folios,
@@ -677,8 +680,17 @@ fn map_folio_error(err: &FolioError) -> Response {
         FolioError::AuthorizationDenied | FolioError::UnauthorizedActivation { .. } => {
             authorization_denied_response()
         }
-        FolioError::TtlExceedsCeiling { .. } => auth_error_response(
-            StatusCode::BAD_REQUEST,
+        FolioError::TtlExceedsCeiling { .. } | FolioError::InvalidTimedRenewalBounds { .. } => {
+            auth_error_response(
+                StatusCode::BAD_REQUEST,
+                AuthReasonCodeDto::CeilingExceeded,
+                &err.to_string(),
+            )
+        }
+        FolioError::LeaseNotRenewable { .. }
+        | FolioError::RenewalWindowNotReached { .. }
+        | FolioError::RenewalLimitReached { .. } => auth_error_response(
+            StatusCode::CONFLICT,
             AuthReasonCodeDto::CeilingExceeded,
             &err.to_string(),
         ),
@@ -1638,10 +1650,16 @@ fn issue_step_up_challenge(
         Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, &json!({ "error": e })),
     };
 
-    if purpose == StepUpPurpose::ElevateRole {
-        let target_role = role_id
-            .as_deref()
-            .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
+    if matches!(
+        purpose,
+        StepUpPurpose::ElevateRole | StepUpPurpose::RenewRole
+    ) {
+        let default_role = if purpose == StepUpPurpose::RenewRole {
+            SUPER_OPERATOR_ROLE_ID
+        } else {
+            crate::auth::ADMIN_TIMED_ROLE_ID
+        };
+        let target_role = role_id.as_deref().unwrap_or(default_role);
         if RoleId::new(target_role).is_err() {
             return bad_request_response("Invalid role_id");
         }
@@ -1650,10 +1668,16 @@ fn issue_step_up_challenge(
     let now_ms = current_epoch_ms();
     let res = mutate_auth(&state.job_store, |st| {
         st.prune_challenges(now_ms);
-        if purpose == StepUpPurpose::ElevateRole {
-            let target_role = role_id
-                .as_deref()
-                .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
+        if matches!(
+            purpose,
+            StepUpPurpose::ElevateRole | StepUpPurpose::RenewRole
+        ) {
+            let default_role = if purpose == StepUpPurpose::RenewRole {
+                SUPER_OPERATOR_ROLE_ID
+            } else {
+                crate::auth::ADMIN_TIMED_ROLE_ID
+            };
+            let target_role = role_id.as_deref().unwrap_or(default_role);
             let Ok(parsed_rid) = RoleId::new(target_role) else {
                 return err_resp(bad_request_response("Invalid role_id"));
             };
@@ -1666,6 +1690,38 @@ fn issue_step_up_challenge(
                 .is_some_and(|set| set.contains(&parsed_rid));
             if !bound {
                 return err_resp(authorization_denied_response());
+            }
+            if purpose == StepUpPurpose::RenewRole {
+                let active_lease = st
+                    .role_leases
+                    .get(login_key)
+                    .and_then(|leases| leases.timed_leases.get(&parsed_rid))
+                    .filter(|lease| lease.is_active(now_ms));
+                let Some(lease) = active_lease else {
+                    return err_resp(authorization_denied_response());
+                };
+                if !lease.can_renew(now_ms) {
+                    let fe = if lease.max_renewals == 0
+                        || lease.renew_window_secs == 0
+                        || lease.renew_extend_secs == 0
+                    {
+                        FolioError::LeaseNotRenewable {
+                            role: target_role.to_string(),
+                        }
+                    } else if lease.renewals_used >= lease.max_renewals {
+                        FolioError::RenewalLimitReached {
+                            role: target_role.to_string(),
+                            max_renewals: lease.max_renewals,
+                        }
+                    } else {
+                        FolioError::RenewalWindowNotReached {
+                            role: target_role.to_string(),
+                            seconds_remaining: lease.hard_remaining_secs(now_ms),
+                            renew_window_secs: lease.renew_window_secs,
+                        }
+                    };
+                    return err_resp(map_folio_error(&fe));
+                }
             }
         }
 
@@ -1928,16 +1984,25 @@ pub async fn elevate_start(
     };
     let purpose = match payload.purpose.as_deref().map(str::trim) {
         Some("passkey_manage") => StepUpPurpose::PasskeyManage,
+        Some("renew_role") => StepUpPurpose::RenewRole,
         _ => StepUpPurpose::ElevateRole,
     };
-    let role_id = if purpose == StepUpPurpose::ElevateRole {
+    let role_id = if matches!(
+        purpose,
+        StepUpPurpose::ElevateRole | StepUpPurpose::RenewRole
+    ) {
+        let default_role = if purpose == StepUpPurpose::RenewRole {
+            SUPER_OPERATOR_ROLE_ID
+        } else {
+            crate::auth::ADMIN_TIMED_ROLE_ID
+        };
         Some(
             payload
                 .role_id
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID)
+                .unwrap_or(default_role)
                 .to_string(),
         )
     } else {
@@ -1945,6 +2010,32 @@ pub async fn elevate_start(
     };
 
     issue_step_up_challenge(&state, &login, &login_key, purpose, role_id)
+}
+
+/// `POST /api/auth/roles/{role_id}/renew/start`
+pub async fn renew_role_start(
+    State(state): State<Arc<AppState>>,
+    Path(role_id): Path<String>,
+    headers: HeaderMap,
+    raw_body: Option<Json<Value>>,
+) -> Response {
+    if let Some(Json(ref raw_val)) = raw_body {
+        if payload_has_forbidden_ttl_fields(raw_val) {
+            return forbidden_ttl_override_response();
+        }
+    }
+    let eval = EvaluatedRequestAuth::evaluate(&state.config, &state.job_store, &headers, None);
+    let (login, login_key) = match eval.require_bound_user(true) {
+        Ok(pair) => pair,
+        Err(resp) => return *resp,
+    };
+    issue_step_up_challenge(
+        &state,
+        &login,
+        &login_key,
+        StepUpPurpose::RenewRole,
+        Some(role_id.trim().to_string()),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1965,6 +2056,45 @@ pub async fn elevate_finish(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(raw_body): Json<Value>,
+) -> Response {
+    finish_step_up_or_renew(state, headers, raw_body, None).await
+}
+
+/// `POST /api/auth/roles/{role_id}/renew`
+///
+/// Verifies a fresh Passkey step-up assertion against an active renewable `Timed` lease
+/// inside its final renewal window, extends the server-derived lease, and refreshes
+/// `__Host-mu_elevated` cookie expiration.
+pub async fn renew_role_finish(
+    State(state): State<Arc<AppState>>,
+    Path(role_id): Path<String>,
+    headers: HeaderMap,
+    Json(mut raw_body): Json<Value>,
+) -> Response {
+    if payload_has_forbidden_ttl_fields(&raw_body) {
+        return forbidden_ttl_override_response();
+    }
+    let clean_role = role_id.trim();
+    if let Some(body_role) = raw_body
+        .get("role_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if body_role != clean_role {
+            return bad_request_response("Mismatched role_id in renewal request");
+        }
+    } else if let Some(obj) = raw_body.as_object_mut() {
+        obj.insert("role_id".to_string(), Value::String(clean_role.to_string()));
+    }
+    finish_step_up_or_renew(state, headers, raw_body, Some(StepUpPurpose::RenewRole)).await
+}
+
+async fn finish_step_up_or_renew(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    raw_body: Value,
+    expected_purpose: Option<StepUpPurpose>,
 ) -> Response {
     if payload_has_forbidden_ttl_fields(&raw_body) {
         return forbidden_ttl_override_response();
@@ -2014,6 +2144,11 @@ pub async fn elevate_finish(
                 "Step-up challenge expired or belongs to another operator",
             ));
         }
+        if let Some(exp_purpose) = expected_purpose {
+            if pending.purpose != exp_purpose {
+                return err_resp(authorization_denied_response());
+            }
+        }
 
         let creds: Vec<_> = st
             .passkeys
@@ -2060,13 +2195,19 @@ pub async fn elevate_finish(
             ));
         }
 
+        let renewed = pending.purpose == StepUpPurpose::RenewRole;
+        let default_role = if renewed {
+            SUPER_OPERATOR_ROLE_ID
+        } else {
+            crate::auth::ADMIN_TIMED_ROLE_ID
+        };
         let target_role_str = payload
             .role_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .or(pending.role_id.as_deref())
-            .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
+            .unwrap_or(default_role);
 
         let Ok(target_rid) = RoleId::new(target_role_str) else {
             return err_resp(bad_request_response("Invalid role_id"));
@@ -2076,18 +2217,31 @@ pub async fn elevate_finish(
                 return err_resp(authorization_denied_response());
             }
         }
-        let (_, maybe_lease) =
-            activate_server_role_lease(st, &login_key, &target_rid, true, now_ms).map_err(
-                |(code, msg)| Box::new(auth_error_response(StatusCode::FORBIDDEN, code, &msg)),
-            )?;
-
-        st.record_audit(
-            &login,
-            "role.elevate",
-            Some(target_rid.to_string()),
-            "ok",
-            now_ms,
-        );
+        let maybe_lease = if renewed {
+            let (_, lease) = renew_server_role_lease(st, &login_key, &target_rid, true, now_ms)
+                .map_err(|fe| Box::new(map_folio_error(&fe)))?;
+            st.record_audit(
+                &login,
+                "role.renew",
+                Some(target_rid.to_string()),
+                "ok",
+                now_ms,
+            );
+            Some(lease)
+        } else {
+            let (_, lease) = activate_server_role_lease(st, &login_key, &target_rid, true, now_ms)
+                .map_err(|(code, msg)| {
+                    Box::new(auth_error_response(StatusCode::FORBIDDEN, code, &msg))
+                })?;
+            st.record_audit(
+                &login,
+                "role.elevate",
+                Some(target_rid.to_string()),
+                "ok",
+                now_ms,
+            );
+            lease
+        };
         st.snapshot_revision = st.snapshot_revision.saturating_add(1);
 
         let epoch = st
@@ -2120,6 +2274,7 @@ pub async fn elevate_finish(
         Ok((
             json!({
                 "elevated": true,
+                "renewed": renewed,
                 "role_id": target_rid.as_str(),
                 "sign_count": outcome.new_sign_count,
                 "leases": session.leases,

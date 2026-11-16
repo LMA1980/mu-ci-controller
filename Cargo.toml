@@ -11,7 +11,7 @@ default = []
 bundled-duckdb = []
 
 [dependencies]
-mu-auth = { git = "https://github.com/LMA1980/mu-auth.git", rev = "b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951", features = ["github-oauth"] }
+mu-auth = { git = "https://github.com/LMA1980/mu-auth.git", rev = "0c8970657f3e0f2f2921ee65ed754183b9e06a47", features = ["github-oauth"] }
 mu-ci-ipc = { git = "https://github.com/LMA1980/mu-ci-ipc.git", branch = "main" }
 mu-ci-tools = { git = "https://github.com/LMA1980/mu-ci-tools.git", branch = "main" }
 mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
