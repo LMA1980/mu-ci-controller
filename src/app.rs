@@ -139,6 +139,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(crate::console::platform_auth::disable_role),
         )
         .route(
+            "/api/auth/roles/{role_id}/renew/start",
+            post(crate::console::platform_auth::renew_role_start),
+        )
+        .route(
+            "/api/auth/roles/{role_id}/renew",
+            post(crate::console::platform_auth::renew_role_finish),
+        )
+        .route(
             "/api/auth/elevate/start",
             post(crate::console::platform_auth::elevate_start),
         )

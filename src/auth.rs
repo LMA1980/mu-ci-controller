@@ -25,6 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const BASELINE_ROLE_ID: &str = "operator";
 pub const ELECTIVE_CI_ROLE_ID: &str = "ci-operator";
 pub const ADMIN_TIMED_ROLE_ID: &str = "platform-admin";
+pub const SUPER_OPERATOR_ROLE_ID: &str = mu_auth::SUPER_OPERATOR_ROLE_ID;
 pub const DEFAULT_ADMIN_HARD_TTL_SECS: u64 = 900;
 pub const DEFAULT_ADMIN_IDLE_TTL_SECS: u64 = 300;
 pub const ELEVATED_COOKIE_NAME: &str = "__Host-mu_elevated";
@@ -83,6 +84,16 @@ pub struct RoleLeaseViewDto {
     pub idle_ttl_secs: u64,
     pub seconds_remaining: u64,
     pub idle_timer: u64,
+    #[serde(default)]
+    pub renew_window_secs: u64,
+    #[serde(default)]
+    pub renew_extend_secs: u64,
+    #[serde(default)]
+    pub max_renewals: u32,
+    #[serde(default)]
+    pub renewals_used: u32,
+    #[serde(default)]
+    pub can_renew: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +159,8 @@ pub struct AuthSessionDto {
     #[serde(default)]
     pub baseline_role: Option<String>,
     pub bound_roles: Vec<String>,
+    #[serde(default)]
+    pub bound_role_specs: Vec<RoleSpec>,
     pub active_roles: Vec<RoleSpec>,
     pub leases: Vec<RoleLeaseViewDto>,
     pub active_folios: Vec<String>,
@@ -220,6 +233,7 @@ pub struct PlatformInviteRecord {
 #[serde(rename_all = "snake_case")]
 pub enum StepUpPurpose {
     ElevateRole,
+    RenewRole,
     PasskeyManage,
 }
 
@@ -261,6 +275,8 @@ pub struct PlatformAuthState {
     pub passkeys: BTreeMap<String, Vec<StoredPasskeyRecord>>,
     pub role_leases: BTreeMap<String, RoleLeases>,
     pub bootstrap_seeded: BTreeSet<String>,
+    #[serde(default)]
+    pub super_operator_seeded: bool,
     pub audit_activity: Vec<AuditActivityEntryDto>,
     pub snapshot_revision: u64,
     #[serde(skip)]
@@ -304,9 +320,11 @@ impl PlatformAuthState {
             DEFAULT_ADMIN_IDLE_TTL_SECS,
         )
         .expect("canonical platform-admin role valid");
+        let super_operator = RoleSpec::super_operator();
 
-        let role_catalog = RoleCatalog::from_roles([baseline, ci_op, platform_admin])
-            .expect("canonical default role catalog valid");
+        let role_catalog =
+            RoleCatalog::from_roles([baseline, ci_op, platform_admin, super_operator])
+                .expect("canonical default role catalog valid");
 
         let mut role_folio_index = RoleFolioIndex::new();
         role_folio_index
@@ -360,6 +378,16 @@ impl PlatformAuthState {
                 &role_catalog,
             )
             .expect("canonical platform-admin folios valid");
+        role_folio_index
+            .set_role_folios(
+                rid(SUPER_OPERATOR_ROLE_ID),
+                mu_auth::canonical_super_operator_folios()
+                    .into_iter()
+                    .collect(),
+                &folio_catalog,
+                &role_catalog,
+            )
+            .expect("canonical super-operator folios valid");
 
         role_folio_index
             .validate(&folio_catalog, Some(&role_catalog))
@@ -377,6 +405,7 @@ impl PlatformAuthState {
             passkeys: BTreeMap::new(),
             role_leases: BTreeMap::new(),
             bootstrap_seeded: BTreeSet::new(),
+            super_operator_seeded: true,
             audit_activity: Vec::new(),
             snapshot_revision: 1,
             pending_registrations: HashMap::new(),
@@ -394,6 +423,57 @@ impl PlatformAuthState {
         }
         for m in mu_auth::canonical_manifests() {
             let _ = self.folio_catalog.register_manifest(m);
+        }
+        if !self.super_operator_seeded {
+            let super_rid = rid(SUPER_OPERATOR_ROLE_ID);
+            let mut changed = false;
+            if self.role_catalog.get(&super_rid).is_none()
+                && self
+                    .role_catalog
+                    .upsert_role(RoleSpec::super_operator())
+                    .is_ok()
+            {
+                changed = true;
+            }
+            if self.role_folio_index.folios_for_role(&super_rid).is_none()
+                && self
+                    .role_folio_index
+                    .set_role_folios(
+                        super_rid.clone(),
+                        mu_auth::canonical_super_operator_folios()
+                            .into_iter()
+                            .collect(),
+                        &self.folio_catalog,
+                        &self.role_catalog,
+                    )
+                    .is_ok()
+            {
+                changed = true;
+            }
+            let admin_keys: Vec<String> = self
+                .users
+                .iter()
+                .filter(|(key, user)| {
+                    !user.revoked
+                        && (self.user_has_platform_admin_binding(key)
+                            || self.bootstrap_seeded.contains(*key))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in admin_keys {
+                if self
+                    .user_roles
+                    .entry(key)
+                    .or_default()
+                    .insert(super_rid.clone())
+                {
+                    changed = true;
+                }
+            }
+            self.super_operator_seeded = true;
+            if changed {
+                self.snapshot_revision = self.snapshot_revision.saturating_add(1);
+            }
         }
     }
 
@@ -467,6 +547,11 @@ impl PlatformAuthState {
             }
             if let Some(admin_role) = self.role_catalog.get(&rid(ADMIN_TIMED_ROLE_ID)) {
                 if roles.insert(admin_role.id.clone()) {
+                    changed = true;
+                }
+            }
+            if let Some(super_role) = self.role_catalog.get(&rid(SUPER_OPERATOR_ROLE_ID)) {
+                if roles.insert(super_role.id.clone()) {
                     changed = true;
                 }
             }
@@ -749,6 +834,9 @@ impl PlatformAuthState {
             let RoleActivation::Timed {
                 hard_ttl_secs,
                 idle_ttl_secs,
+                renew_window_secs,
+                renew_extend_secs,
+                max_renewals,
             } = spec.activation
             else {
                 continue;
@@ -767,6 +855,11 @@ impl PlatformAuthState {
                 idle_ttl_secs,
                 seconds_remaining: lease.seconds_remaining(now_ms),
                 idle_timer: lease.idle_remaining_secs(now_ms),
+                renew_window_secs,
+                renew_extend_secs,
+                max_renewals,
+                renewals_used: lease.renewals_used,
+                can_renew: lease.can_renew(now_ms),
             });
         }
         views
@@ -797,6 +890,7 @@ impl PlatformAuthState {
                 anonymous_login_only: anon_lockdown,
                 baseline_role: Some(baseline_id),
                 bound_roles: Vec::new(),
+                bound_role_specs: Vec::new(),
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -819,6 +913,7 @@ impl PlatformAuthState {
                 anonymous_login_only: anon_lockdown,
                 baseline_role: Some(baseline_id),
                 bound_roles: Vec::new(),
+                bound_role_specs: Vec::new(),
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -834,6 +929,11 @@ impl PlatformAuthState {
             .get(key)
             .map(|r| r.iter().map(ToString::to_string).collect::<Vec<_>>())
             .unwrap_or_else(|| vec![baseline_id.clone()]);
+        let bound_role_specs: Vec<RoleSpec> = bound_roles
+            .iter()
+            .filter_map(|id| RoleId::new(id.as_str()).ok())
+            .filter_map(|id| self.role_catalog.get(&id).cloned())
+            .collect();
         let prefs = self.user_prefs.get(key).copied().unwrap_or_default();
 
         if eval.passkey_enrollment_required || passkey_count == 0 {
@@ -849,6 +949,7 @@ impl PlatformAuthState {
                 anonymous_login_only: anon_lockdown,
                 baseline_role: Some(baseline_id),
                 bound_roles,
+                bound_role_specs,
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: Vec::new(),
@@ -863,7 +964,9 @@ impl PlatformAuthState {
             .iter()
             .filter_map(|id| self.role_catalog.get(id).cloned())
             .collect();
-        let active_role_label = if eval.policies.contains_str("platform:users.write") {
+        let active_role_label = if eval.has_role_str(SUPER_OPERATOR_ROLE_ID) {
+            Some(SUPER_OPERATOR_ROLE_ID.to_string())
+        } else if eval.policies.contains_str("platform:users.write") {
             Some(ADMIN_TIMED_ROLE_ID.to_string())
         } else {
             Some(baseline_id.clone())
@@ -881,6 +984,7 @@ impl PlatformAuthState {
             anonymous_login_only: anon_lockdown,
             baseline_role: Some(baseline_id),
             bound_roles,
+            bound_role_specs,
             active_roles,
             leases: self.build_lease_views(leases, now_ms),
             active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -1428,6 +1532,48 @@ pub fn activate_server_role_lease(
     }
 }
 
+/// Extends an active renewable `Timed` role lease within its renewal window after Passkey verification.
+pub fn renew_server_role_lease(
+    state: &mut PlatformAuthState,
+    login_key: &str,
+    role_id: &RoleId,
+    step_up_verified: bool,
+    now_ms: u64,
+) -> Result<(RoleSpec, mu_auth::RoleLease), mu_auth::FolioError> {
+    let spec = state
+        .role_catalog
+        .get(role_id)
+        .cloned()
+        .ok_or_else(|| mu_auth::FolioError::UnknownRole(role_id.to_string()))?;
+    let bound_roles = state.user_roles.get(login_key).cloned().unwrap_or_default();
+    if !bound_roles.contains(role_id) {
+        return Err(mu_auth::FolioError::UnauthorizedActivation {
+            role: role_id.to_string(),
+        });
+    }
+    let user = state
+        .users
+        .get(login_key)
+        .filter(|u| !u.revoked)
+        .ok_or(mu_auth::FolioError::AuthorizationDenied)?;
+    let passkey_count = state.passkey_count_for(login_key) as usize;
+    let principal = Principal::Authenticated {
+        login: user.github_login.clone(),
+        bound_roles,
+        passkey_count,
+    };
+
+    let role_catalog = &state.role_catalog;
+    let leases = state
+        .role_leases
+        .entry(login_key.to_string())
+        .or_insert_with(|| RoleLeases::for_login(role_catalog, &principal));
+    let lease = leases
+        .renew_timed(role_catalog, &principal, role_id, now_ms, step_up_verified)?
+        .clone();
+    Ok((spec, lease))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1632,5 +1778,96 @@ mod tests {
             st.has_active_platform_admin(),
             "alice retains platform-admin so LMA1980 can be safely revoked"
         );
+    }
+
+    #[test]
+    fn reconcile_migrates_legacy_state_to_seed_super_operator_and_renews_in_window() {
+        let mut st = PlatformAuthState::seeded_default();
+        let now = Utc::now();
+        st.seed_bootstrap_admins(&["LMA1980".to_string()], now);
+        assert!(st
+            .user_roles
+            .get("lma1980")
+            .unwrap()
+            .contains(&rid(SUPER_OPERATOR_ROLE_ID)));
+
+        // Simulate legacy snapshot loaded before `super-operator` existed.
+        st.super_operator_seeded = false;
+        st.role_folio_index.clear_role(&rid(SUPER_OPERATOR_ROLE_ID));
+        st.role_catalog
+            .remove_role(&rid(SUPER_OPERATOR_ROLE_ID))
+            .unwrap();
+        st.user_roles
+            .get_mut("lma1980")
+            .unwrap()
+            .remove(&rid(SUPER_OPERATOR_ROLE_ID));
+        st.reconcile_after_load();
+        assert!(st.super_operator_seeded);
+        assert!(st.role_catalog.get(&rid(SUPER_OPERATOR_ROLE_ID)).is_some());
+        assert!(st
+            .user_roles
+            .get("lma1980")
+            .unwrap()
+            .contains(&rid(SUPER_OPERATOR_ROLE_ID)));
+
+        let principal = Principal::Authenticated {
+            login: "LMA1980".to_string(),
+            passkey_count: 1,
+            bound_roles: st.user_roles.get("lma1980").cloned().unwrap(),
+        };
+        let mut leases = RoleLeases::for_login(&st.role_catalog, &principal);
+        leases
+            .activate_timed(
+                &st.role_catalog,
+                &principal,
+                &rid(SUPER_OPERATOR_ROLE_ID),
+                0,
+                true,
+            )
+            .unwrap();
+        let views_before = st.build_lease_views(&leases, 1_000);
+        assert_eq!(views_before.len(), 1);
+        assert!(!views_before[0].can_renew);
+        assert_eq!(views_before[0].renew_window_secs, 120);
+        assert_eq!(views_before[0].renew_extend_secs, 900);
+        assert_eq!(views_before[0].max_renewals, 1);
+
+        for t in [
+            90_000, 180_000, 270_000, 360_000, 450_000, 540_000, 630_000, 720_000, 779_000,
+        ] {
+            let _ = leases.record_activity(t);
+        }
+        assert!(!st.build_lease_views(&leases, 779_000)[0].can_renew);
+        let _ = leases.record_activity(780_000);
+        assert!(st.build_lease_views(&leases, 780_000)[0].can_renew);
+
+        leases
+            .renew_timed(
+                &st.role_catalog,
+                &principal,
+                &rid(SUPER_OPERATOR_ROLE_ID),
+                780_000,
+                true,
+            )
+            .unwrap();
+        let views_after = st.build_lease_views(&leases, 780_000);
+        assert_eq!(views_after[0].renewals_used, 1);
+        assert!(!views_after[0].can_renew);
+        let eval_after = mu_auth::evaluate_session(
+            &st.folio_catalog,
+            &st.role_catalog,
+            &st.role_folio_index,
+            &principal,
+            &leases,
+            780_000,
+        )
+        .unwrap();
+        assert!(eval_after.has_role_str(SUPER_OPERATOR_ROLE_ID));
+        assert_eq!(eval_after.policies.len(), 47);
+        let dto = st.build_session_dto(Some("lma1980"), &leases, &eval_after, 780_000);
+        assert!(dto
+            .bound_role_specs
+            .iter()
+            .any(|s| s.id.as_str() == SUPER_OPERATOR_ROLE_ID));
     }
 }

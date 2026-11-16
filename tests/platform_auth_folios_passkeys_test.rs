@@ -704,7 +704,16 @@ async fn profile_preferences_case_insensitive_logins_and_last_admin_lockout_guar
     .await;
     assert_eq!(st_demote, StatusCode::CONFLICT);
 
-    // c) Deleting platform-admin role
+    // c) Deleting redundant super-operator succeeds, then deleting final admin role platform-admin returns 409 Conflict
+    let (st_delsuper, _, _, _) = req_full(
+        &app,
+        "DELETE",
+        "/api/auth/roles/super-operator",
+        &elevated_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_delsuper, StatusCode::OK);
     let (st_delrole, _, _, _) = req_full(
         &app,
         "DELETE",
@@ -1203,4 +1212,169 @@ async fn role_leases_cookie_tamper_activity_ttl_rejection_and_internal_snapshot_
     .await;
     assert_eq!(st_304, StatusCode::NOT_MODIFIED);
     assert_eq!(etag_304.as_deref(), Some(etag.as_str()));
+}
+
+#[tokio::test]
+async fn super_operator_role_elevation_and_single_last_2m_passkey_renewal() {
+    let (state, _tmp) = make_auth_test_state().await;
+    let app = create_router(state.clone());
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+    let admin_auth = VirtualAuthenticator::new_synced(1, b"cred-super-op-test");
+    enroll_passkey(&app, &admin_hdrs, &admin_auth, "Super Passkey", None).await;
+
+    // 1. Bootstrap admin is bound to both platform-admin and super-operator with full specs.
+    let (st_sess, sess_j, _, _) =
+        req_full(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st_sess, StatusCode::OK);
+    let bound_roles: Vec<&str> = sess_j["bound_roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(bound_roles.contains(&"platform-admin"));
+    assert!(bound_roles.contains(&"super-operator"));
+    assert!(sess_j["bound_role_specs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == "super-operator" && s["activation"]["max_renewals"] == 1));
+
+    // 2. Passkey elevation unlocks all 47 canonical policies across all 8 subsystems.
+    let (st_el, el_j, cookie_opt) =
+        elevate_role(&app, &admin_hdrs, &admin_auth, 0, "super-operator").await;
+    assert_eq!(st_el, StatusCode::OK);
+    let cookie_1 = cookie_opt.expect("__Host-mu_elevated cookie required");
+    assert_eq!(el_j["session"]["role"], "super-operator");
+    assert_eq!(
+        el_j["session"]["active_policies"].as_array().unwrap().len(),
+        47
+    );
+    let lease_0 = &el_j["session"]["leases"][0];
+    assert_eq!(lease_0["role_id"], "super-operator");
+    assert_eq!(lease_0["hard_ttl_secs"], 900);
+    assert_eq!(lease_0["idle_ttl_secs"], 120);
+    assert_eq!(lease_0["renew_window_secs"], 120);
+    assert_eq!(lease_0["renew_extend_secs"], 900);
+    assert_eq!(lease_0["max_renewals"], 1);
+    assert_eq!(lease_0["renewals_used"], 0);
+    assert_eq!(lease_0["can_renew"], false);
+
+    // 3. Attempting renewal outside the last-2m window is rejected with 409 Conflict.
+    let el_hdrs_1 = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", cookie_1.as_str()),
+    ];
+    let (st_early, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/roles/super-operator/renew/start",
+        &el_hdrs_1,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_early, StatusCode::CONFLICT);
+
+    // 4. Advance lease timeline into the final 2m (100s remaining <= 120s window) and renew once.
+    let mut old_hard_exp = 0_u64;
+    state
+        .job_store
+        .mutate_platform_auth(|st| {
+            let rid = mu_auth::RoleId::new("super-operator").unwrap();
+            let now_ms = mu_ci_controller::auth::current_epoch_ms();
+            let lease = st
+                .role_leases
+                .get_mut("lma1980")
+                .unwrap()
+                .timed_leases
+                .get_mut(&rid)
+                .unwrap();
+            lease.activated_at_ms = now_ms.saturating_sub(800_000);
+            lease.last_activity_at_ms = now_ms;
+            lease.hard_expires_at_ms = now_ms.saturating_add(100_000);
+            lease.idle_expires_at_ms = now_ms.saturating_add(100_000);
+            old_hard_exp = lease.hard_expires_at_ms;
+        })
+        .unwrap();
+
+    let (st_win, win_j, _, _) = req_full(&app, "GET", "/api/auth/session", &el_hdrs_1, None).await;
+    assert_eq!(st_win, StatusCode::OK);
+    assert!(win_j["session"].is_null());
+    assert_eq!(win_j["leases"][0]["can_renew"], true);
+
+    let (st_rstart, rstart_j, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/roles/super-operator/renew/start",
+        &el_hdrs_1,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_rstart, StatusCode::OK);
+    let challenge_id = rstart_j["challenge_id"].as_str().unwrap().to_string();
+    let challenge = URL_SAFE_NO_PAD
+        .decode(
+            rstart_j["options"]["publicKey"]["challenge"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    let cred = admin_auth.assert_response(&challenge, 0);
+    let (st_rfin, rfin_j, cookie_2_opt, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/roles/super-operator/renew",
+        &el_hdrs_1,
+        Some(json!({
+            "challenge_id": challenge_id,
+            "credential": cred,
+        })),
+    )
+    .await;
+    assert_eq!(st_rfin, StatusCode::OK);
+    assert_eq!(rfin_j["renewed"], true);
+    let cookie_2 = cookie_2_opt.expect("refreshed __Host-mu_elevated cookie required");
+    let new_hard_exp = rfin_j["session"]["leases"][0]["hard_expires_at_ms"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(new_hard_exp, old_hard_exp + 900_000);
+    assert_eq!(rfin_j["session"]["leases"][0]["renewals_used"], 1);
+    assert_eq!(rfin_j["session"]["leases"][0]["can_renew"], false);
+
+    // 5. Attempting a second renewal fails closed with 409 Conflict even near new hard expiry.
+    state
+        .job_store
+        .mutate_platform_auth(|st| {
+            let rid = mu_auth::RoleId::new("super-operator").unwrap();
+            let now_ms = mu_ci_controller::auth::current_epoch_ms();
+            let lease = st
+                .role_leases
+                .get_mut("lma1980")
+                .unwrap()
+                .timed_leases
+                .get_mut(&rid)
+                .unwrap();
+            lease.last_activity_at_ms = now_ms;
+            lease.hard_expires_at_ms = now_ms.saturating_add(90_000);
+            lease.idle_expires_at_ms = now_ms.saturating_add(90_000);
+        })
+        .unwrap();
+    let el_hdrs_2 = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", cookie_2.as_str()),
+    ];
+    let (st_second, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/roles/super-operator/renew/start",
+        &el_hdrs_2,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_second, StatusCode::CONFLICT);
 }
