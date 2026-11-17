@@ -2879,3 +2879,163 @@ async fn unauthenticated_github_client_preserves_history_only_behavior() {
     let hist = find_repo(&authed, "history-only").expect("history-only visible to authed callers");
     assert_eq!(hist["visibility"], Value::Null);
 }
+
+#[tokio::test]
+async fn redirected_renamed_github_repo_full_name_mismatch_auto_retires_in_refresh_and_prune() {
+    // Mock GitHub returns 200 OK with canonical `"full_name": "LMA1980/mu-ci-controller"`
+    // when queried for the legacy pre-rename path `GET /repos/LMA1980/ActionRunner-controller`,
+    // simulating reqwest following GitHub's HTTP 301 redirect.
+    let mut repos: BTreeMap<&'static str, Value> = BTreeMap::new();
+    repos.insert(
+        "LMA1980/ActionRunner-controller",
+        json!({
+            "full_name": "LMA1980/mu-ci-controller",
+            "private": false,
+            "visibility": "public",
+            "default_branch": "main"
+        }),
+    );
+    repos.insert(
+        "LMA1980/mu-ci-controller",
+        json!({
+            "full_name": "LMA1980/mu-ci-controller",
+            "private": false,
+            "visibility": "public",
+            "default_branch": "main"
+        }),
+    );
+    let repos = Arc::new(repos);
+
+    let mock_app = Router::new()
+        .route(
+            "/repos/{owner}/{repo}",
+            get({
+                let repos = repos.clone();
+                move |axum::extract::Path((o, r)): axum::extract::Path<(String, String)>| {
+                    let repos = repos.clone();
+                    async move {
+                        match repos.get(format!("{o}/{r}").as_str()) {
+                            Some(v) => (StatusCode::OK, v.to_string()),
+                            None => (StatusCode::NOT_FOUND, "{}".to_string()),
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/{owner}/{repo}/contents/{*path}",
+            get(|| async { (StatusCode::NOT_FOUND, "{}".to_string()) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    let api_url = format!("http://{addr}");
+
+    // 1. Authenticated refresh_repo detects the full_name mismatch and auto-retires the legacy name.
+    let console_refresh = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api_url.clone()),
+        github_token: Some("ghp_test_token".to_string()),
+        ..ConsoleConfig::default()
+    });
+    console_refresh
+        .refresh_repo("LMA1980", "ActionRunner-controller", None)
+        .await;
+    assert!(
+        console_refresh
+            .is_retired("LMA1980", "ActionRunner-controller")
+            .await
+    );
+    assert!(console_refresh
+        .entry("LMA1980", "ActionRunner-controller")
+        .await
+        .is_none());
+
+    console_refresh
+        .refresh_repo("LMA1980", "mu-ci-controller", None)
+        .await;
+    assert!(
+        !console_refresh
+            .is_retired("LMA1980", "mu-ci-controller")
+            .await
+    );
+    assert!(console_refresh
+        .entry("LMA1980", "mu-ci-controller")
+        .await
+        .is_some());
+
+    // 2. POST /api/repos/prune with `{}` probes known repos, detects the redirect mismatch on
+    //    `LMA1980/ActionRunner-controller`, retires it, and leaves `LMA1980/mu-ci-controller` active.
+    let console_prune = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api_url),
+        github_token: Some("ghp_test_token".to_string()),
+        ..ConsoleConfig::default()
+    });
+    let mut cfg = test_config(Some(API_KEY));
+    cfg.github_token = Some("ghp_test_token".to_string());
+    let job_store = JobStore::new(100, None);
+    completed_job(
+        &job_store,
+        "job-legacy-redirect-1",
+        "LMA1980/ActionRunner-controller",
+        "refs/heads/main",
+        SHA_CORE,
+        5,
+        None,
+    )
+    .await;
+    completed_job(
+        &job_store,
+        "job-canonical-1",
+        "LMA1980/mu-ci-controller",
+        "refs/heads/main",
+        SHA_CHILD,
+        3,
+        None,
+    )
+    .await;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console: console_prune,
+    });
+    let app = create_router(state.clone());
+
+    let bearer_auth = format!("Bearer {API_KEY}");
+    let (st_prune, prune_json, prune_txt) = send_req(
+        &app,
+        "POST",
+        "/api/repos/prune",
+        &[("Authorization", bearer_auth.as_str())],
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_prune, StatusCode::OK, "prune failed: {prune_txt}");
+    assert_eq!(
+        prune_json["retired"],
+        json!(["LMA1980/ActionRunner-controller"])
+    );
+    assert!(
+        state
+            .console
+            .is_retired("LMA1980", "ActionRunner-controller")
+            .await
+    );
+    assert!(
+        !state
+            .console
+            .is_retired("LMA1980", "mu-ci-controller")
+            .await
+    );
+
+    let (_, repos_json) = get_json(&app, "/api/repos", Some(API_KEY)).await;
+    assert!(find_repo(&repos_json, "ActionRunner-controller").is_none());
+    assert!(find_repo(&repos_json, "mu-ci-controller").is_some());
+}
