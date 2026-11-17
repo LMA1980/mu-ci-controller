@@ -86,11 +86,12 @@ impl EvaluatedRequestAuth {
         if !config.bootstrap_admins.is_empty() {
             let needs_seed = job_store
                 .read_platform_auth(|st| {
-                    config
-                        .bootstrap_admins
-                        .iter()
-                        .filter_map(|raw| normalize_login(raw))
-                        .any(|key| !st.bootstrap_seeded.contains(&key))
+                    !st.bootstrap_ci_operator_seeded
+                        || config
+                            .bootstrap_admins
+                            .iter()
+                            .filter_map(|raw| normalize_login(raw))
+                            .any(|key| !st.bootstrap_seeded.contains(&key))
                 })
                 .unwrap_or(false);
             if needs_seed {
@@ -253,6 +254,7 @@ impl EvaluatedRequestAuth {
                         baseline_role: Some(crate::auth::BASELINE_ROLE_ID.to_string()),
                         bound_roles: Vec::new(),
                         bound_role_specs: Vec::new(),
+                        catalog_role_specs: Vec::new(),
                         active_roles: Vec::new(),
                         leases: Vec::new(),
                         active_folios: Vec::new(),
@@ -333,6 +335,7 @@ impl EvaluatedRequestAuth {
             baseline_role: Some(baseline),
             bound_roles: vec!["admin".to_string()],
             bound_role_specs: roles.clone(),
+            catalog_role_specs: roles.clone(),
             active_roles: roles,
             leases: Vec::new(),
             active_folios: all_folios,

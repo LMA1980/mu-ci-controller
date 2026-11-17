@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::cluster::{ClusterRegistry, WorkerCommand};
 use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
-use crate::storage_backend::job_root_trace_context;
+use crate::storage_backend::{classify_ci_error_message, job_root_trace_context};
 use crate::workflow::{ActionRunnerWorkflow, StageConfig, UnavailableAction};
 use mu_ci_ipc::{
     NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, SccacheMode, StageDispatchTask,
@@ -425,8 +425,9 @@ impl DAGScheduler {
             Ok(wf) => wf,
             Err(err) => {
                 warn!(job_id = %job.id, error = %err, "Failed to load workflow; failing job");
+                let final_status = JobStatus::Failed { error: err.clone() };
                 self.job_store
-                    .update_status(&job.id, JobStatus::Failed { error: err.clone() })
+                    .update_status(&job.id, final_status.clone())
                     .await;
                 self.report_github_status(
                     &job.repo_name,
@@ -436,6 +437,8 @@ impl DAGScheduler {
                     Some(&target_url),
                 )
                 .await;
+                self.emit_pipeline_root_span(&job, &final_status, start_time);
+                _guard.disarm();
                 return;
             }
         };
@@ -490,13 +493,11 @@ impl DAGScheduler {
                         &job.id,
                         &format!("[controller] status=failed error=\"{}\"\n", err_msg),
                     );
+                    let final_status = JobStatus::Failed {
+                        error: err_msg.clone(),
+                    };
                     self.job_store
-                        .update_status(
-                            &job.id,
-                            JobStatus::Failed {
-                                error: err_msg.clone(),
-                            },
-                        )
+                        .update_status(&job.id, final_status.clone())
                         .await;
                     self.report_github_status(
                         &job.repo_name,
@@ -507,6 +508,8 @@ impl DAGScheduler {
                     )
                     .await;
                     self.job_store.flush_job_log(Some(&job.id));
+                    self.emit_pipeline_root_span(&job, &final_status, start_time);
+                    _guard.disarm();
                     return;
                 }
             }
@@ -614,9 +617,7 @@ impl DAGScheduler {
 
             // Check if job was cancelled or finished, or heal Queued -> Running while active
             match &job_record.status {
-                JobStatus::Completed { .. }
-                | JobStatus::Failed { .. }
-                | JobStatus::Skipped { .. } => {
+                JobStatus::Completed { .. } | JobStatus::Failed { .. } => {
                     self.cluster
                         .cancel_and_release_job_slots(
                             &job.id,
@@ -624,6 +625,18 @@ impl DAGScheduler {
                         )
                         .await;
                     self.job_store.notify_event();
+                    break;
+                }
+                JobStatus::Skipped { .. } => {
+                    self.cluster
+                        .cancel_and_release_job_slots(
+                            &job.id,
+                            "Job finished, cancelled, or superseded",
+                        )
+                        .await;
+                    self.emit_pipeline_root_span(&job, &job_record.status, start_time);
+                    self.job_store.notify_event();
+                    _guard.disarm();
                     break;
                 }
                 JobStatus::Queued => {
@@ -885,13 +898,11 @@ impl DAGScheduler {
                         self.job_store.update_metrics(&job.id, m).await;
                     }
                 }
+                let final_status = JobStatus::Failed {
+                    error: failure_error.clone(),
+                };
                 self.job_store
-                    .update_status(
-                        &job.id,
-                        JobStatus::Failed {
-                            error: failure_error.clone(),
-                        },
-                    )
+                    .update_status(&job.id, final_status.clone())
                     .await;
                 self.report_github_status(
                     &job.repo_name,
@@ -902,6 +913,8 @@ impl DAGScheduler {
                 )
                 .await;
                 self.job_store.flush_job_log(Some(&job.id));
+                self.emit_pipeline_root_span(&job, &final_status, start_time);
+                _guard.disarm();
                 break;
             }
 
@@ -1015,36 +1028,8 @@ impl DAGScheduler {
                 self.job_store.flush_job_log(Some(&job.id));
 
                 // Emit root CI pipeline W3C trace span to MuObserve telemetry
-                let root_ctx = job_root_trace_context(&job.id, &job.commit_sha);
-                let now_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as i64;
-                let duration_ns = duration.saturating_mul(1_000_000_000);
-                let start_ns = (now_ns - duration_ns as i64).max(0);
-                let (span_status_code, span_status_msg) = match &final_status {
-                    JobStatus::Completed { .. } => ("OK".to_string(), None),
-                    JobStatus::Failed { error } => ("ERROR".to_string(), Some(error.clone())),
-                    _ => ("OK".to_string(), None),
-                };
-                let span_entry = OtelSpanEntry {
-                    trace_id: encode_hex(&root_ctx.trace_id),
-                    span_id: encode_hex(&root_ctx.span_id),
-                    parent_span_id: None,
-                    service_name: "mu-ci-controller".to_string(),
-                    node_id: "controller".to_string(),
-                    span_name: format!("ci.pipeline.run:{}", job.repo_name),
-                    span_kind: "SERVER".to_string(),
-                    start_time_unix_nano: start_ns,
-                    end_time_unix_nano: now_ns,
-                    duration_ns,
-                    status_code: span_status_code,
-                    status_message: span_status_msg,
-                    attributes_json: format!(
-                        r#"{{"job_id":"{}","repo":"{}","ref":"{}","sha":"{}"}}"#,
-                        job.id, job.repo_name, job.ref_name, job.commit_sha
-                    ),
-                };
+                let now_ns = current_unix_nano();
+                let span_entry = build_pipeline_root_span(&job, &final_status, duration, now_ns);
                 self.job_store.emit_trace_spans(&[span_entry]);
 
                 _guard.disarm();
@@ -1328,6 +1313,98 @@ impl DAGScheduler {
         }
 
         true
+    }
+
+    fn emit_pipeline_root_span(
+        &self,
+        job: &Job,
+        final_status: &JobStatus,
+        start_time: chrono::DateTime<Utc>,
+    ) {
+        let duration = (Utc::now() - start_time).num_seconds().max(0) as u64;
+        let now_ns = current_unix_nano();
+        let span = build_pipeline_root_span(job, final_status, duration, now_ns);
+        self.job_store.emit_trace_spans(&[span]);
+    }
+}
+
+fn current_unix_nano() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+/// Classifies a terminal [`JobStatus`] into `(status_code, status_message, ci.outcome, ci.failure_class)`
+/// for root `ci.pipeline.run:<repo>` spans (`#219`).
+#[must_use]
+pub(crate) fn classify_pipeline_span_outcome(
+    final_status: &JobStatus,
+) -> (&'static str, Option<String>, &'static str, &'static str) {
+    match final_status {
+        JobStatus::Completed { exit_code: 0, .. } => ("OK", None, "passed", "none"),
+        JobStatus::Completed { .. } => ("OK", None, "user_failure", "user_code"),
+        JobStatus::Skipped { reason } => {
+            if reason.to_ascii_lowercase().contains("superseded") {
+                ("OK", None, "superseded", "superseded")
+            } else {
+                ("OK", None, "cancelled", "cancelled")
+            }
+        }
+        JobStatus::Failed { error } => {
+            let kind = classify_ci_error_message(error);
+            let status_msg = if kind.span_status_code() == "ERROR" {
+                Some(error.clone())
+            } else {
+                None
+            };
+            (
+                kind.span_status_code(),
+                status_msg,
+                kind.outcome_label(),
+                kind.failure_class_label(),
+            )
+        }
+        JobStatus::Queued | JobStatus::Running { .. } => ("OK", None, "in_progress", "none"),
+    }
+}
+
+/// Builds the root `ci.pipeline.run:<repo>` [`OtelSpanEntry`] with controller-health-aligned
+/// span status and structured CI outcome attributes (`#219`).
+#[must_use]
+pub(crate) fn build_pipeline_root_span(
+    job: &Job,
+    final_status: &JobStatus,
+    duration_secs: u64,
+    now_ns: i64,
+) -> OtelSpanEntry {
+    let root_ctx = job_root_trace_context(&job.id, &job.commit_sha);
+    let duration_ns = duration_secs.saturating_mul(1_000_000_000);
+    let start_ns = (now_ns - duration_ns as i64).max(0);
+    let (span_status_code, span_status_msg, outcome, failure_class) =
+        classify_pipeline_span_outcome(final_status);
+    let attrs = serde_json::json!({
+        "job_id": job.id,
+        "repo": job.repo_name,
+        "ref": job.ref_name,
+        "sha": job.commit_sha,
+        "ci.outcome": outcome,
+        "ci.failure_class": failure_class,
+    });
+    OtelSpanEntry {
+        trace_id: encode_hex(&root_ctx.trace_id),
+        span_id: encode_hex(&root_ctx.span_id),
+        parent_span_id: None,
+        service_name: "mu-ci-controller".to_string(),
+        node_id: "controller".to_string(),
+        span_name: format!("ci.pipeline.run:{}", job.repo_name),
+        span_kind: "SERVER".to_string(),
+        start_time_unix_nano: start_ns,
+        end_time_unix_nano: now_ns,
+        duration_ns,
+        status_code: span_status_code.to_string(),
+        status_message: span_status_msg,
+        attributes_json: attrs.to_string(),
     }
 }
 
@@ -4400,5 +4477,91 @@ on_action:
         assert_eq!(calls[0]["context"], "continuous integration");
         assert_ne!(calls[0]["context"], "k3-ci");
         assert_eq!(calls[0]["state"], "pending");
+    }
+
+    #[test]
+    fn pipeline_root_span_separates_user_outcomes_from_infra_health() {
+        let job = Job {
+            id: "job-root-span-1".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            ref_name: "refs/heads/feat/fix".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+            pr_number: Some(12),
+        };
+
+        // 1. Completed cleanly -> OK
+        let s_ok = build_pipeline_root_span(
+            &job,
+            &JobStatus::Completed {
+                duration_secs: 15,
+                exit_code: 0,
+            },
+            15,
+            30_000_000_000,
+        );
+        assert_eq!(s_ok.status_code, "OK");
+        assert_eq!(s_ok.status_message, None);
+        let a_ok: serde_json::Value = serde_json::from_str(&s_ok.attributes_json).unwrap();
+        assert_eq!(a_ok["ci.outcome"], "passed");
+
+        // 2. Ordinary user lint/coverage exit 101 -> OK with user_failure attributes
+        for msg in [
+            "Stage 'clippy-check' failed with code 101",
+            "Tool 'cargo-llvm-cov' exited with status code Some(101)",
+            "RegressionDetected: 1 benchmark regression(s), 0 failing/flaky test(s)",
+        ] {
+            let s_user = build_pipeline_root_span(
+                &job,
+                &JobStatus::Failed {
+                    error: msg.to_string(),
+                },
+                20,
+                30_000_000_000,
+            );
+            assert_eq!(s_user.status_code, "OK", "unexpected ERROR for '{msg}'");
+            assert_eq!(s_user.status_message, None);
+        }
+
+        // 3. Superseded/cancelled -> OK
+        let s_skip = build_pipeline_root_span(
+            &job,
+            &JobStatus::Skipped {
+                reason: "Superseded by pull_request event".to_string(),
+            },
+            5,
+            30_000_000_000,
+        );
+        assert_eq!(s_skip.status_code, "OK");
+        let a_skip: serde_json::Value = serde_json::from_str(&s_skip.attributes_json).unwrap();
+        assert_eq!(a_skip["ci.outcome"], "superseded");
+
+        // 4. Controller/worker infrastructure faults -> ERROR
+        for infra_err in [
+            "Failed to serialize stage dispatch frame: ipc codec error",
+            "Security grant denied: max_pids exceeded",
+            "Failed to spawn tool process 'cargo-test': ENOENT",
+            "Stage 'build' missing from resolved workflow configuration",
+        ] {
+            let s_infra = build_pipeline_root_span(
+                &job,
+                &JobStatus::Failed {
+                    error: infra_err.to_string(),
+                },
+                5,
+                30_000_000_000,
+            );
+            assert_eq!(
+                s_infra.status_code, "ERROR",
+                "expected ERROR for '{infra_err}'"
+            );
+            assert_eq!(s_infra.status_message.as_deref(), Some(infra_err));
+            let a_infra: serde_json::Value =
+                serde_json::from_str(&s_infra.attributes_json).unwrap();
+            assert_eq!(a_infra["ci.outcome"], "infra_failure");
+        }
     }
 }

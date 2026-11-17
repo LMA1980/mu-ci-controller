@@ -692,10 +692,11 @@ impl CatalogStore {
             return;
         };
         guard.auth_state_path = Some(path.clone());
-        match crate::auth::load_auth_state_file(&path) {
-            Ok(Some(loaded)) => {
+        match crate::auth::load_auth_state_file_with_reconciled(&path) {
+            Ok(Some((loaded, reconciled_changed))) => {
                 guard.platform_auth = loaded;
-                if Self::migrate_legacy_mirrors_into_platform_auth(&mut guard) {
+                let migrated = Self::migrate_legacy_mirrors_into_platform_auth(&mut guard);
+                if reconciled_changed || migrated {
                     Self::persist_auth_if_configured(&mut guard);
                 } else {
                     if let Ok(bytes) = std::fs::read(&path) {
