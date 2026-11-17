@@ -56,6 +56,12 @@ impl GitHubClient {
         })
     }
 
+    /// Returns `true` when this client was configured with a non-empty bearer token.
+    #[must_use]
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
     fn request(&self, url: &str, accept: &str) -> reqwest::RequestBuilder {
         let mut req = self
             .http

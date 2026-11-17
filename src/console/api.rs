@@ -372,17 +372,20 @@ fn not_found(owner: &str, repo: &str) -> Response {
 }
 
 /// Every repository the controller knows about: the console registry plus job
-/// history (branch snapshots and in-memory jobs). Keyed by lower-case `owner/repo`.
+/// history (branch snapshots and in-memory jobs), excluding retired repositories.
+/// Keyed by lower-case `owner/repo`.
 pub async fn known_repo_names(
     job_store: &JobStore,
     entries: &BTreeMap<String, RepoEntry>,
+    retired: &BTreeMap<String, DateTime<Utc>>,
 ) -> BTreeMap<String, (String, String)> {
     let mut out: BTreeMap<String, (String, String)> = BTreeMap::new();
     for e in entries.values() {
-        out.insert(
-            repo_key(&e.owner, &e.repo),
-            (e.owner.clone(), e.repo.clone()),
-        );
+        let key = repo_key(&e.owner, &e.repo);
+        if retired.contains_key(&key) {
+            continue;
+        }
+        out.insert(key, (e.owner.clone(), e.repo.clone()));
     }
     let mut names: BTreeSet<String> = job_store
         .storage()
@@ -402,7 +405,11 @@ pub async fn known_repo_names(
             continue;
         }
         if let Some((o, r)) = name.split_once('/') {
-            out.entry(repo_key(o, r))
+            let key = repo_key(o, r);
+            if retired.contains_key(&key) {
+                continue;
+            }
+            out.entry(key)
                 .or_insert_with(|| (o.to_string(), r.to_string()));
         }
     }
@@ -463,13 +470,17 @@ fn can_view(entry: Option<&RepoEntry>, authed: bool) -> bool {
     authed || entry.map(RepoEntry::is_public).unwrap_or(false)
 }
 
-/// Inverted submodule graph: child key -> parents (only parents the caller may see).
+/// Inverted submodule graph: child key -> parents (only active parents the caller may see).
 fn parents_index(
     entries: &BTreeMap<String, RepoEntry>,
+    retired: &BTreeMap<String, DateTime<Utc>>,
     authed: bool,
 ) -> BTreeMap<String, Vec<ParentRef>> {
     let mut idx: BTreeMap<String, Vec<ParentRef>> = BTreeMap::new();
     for parent in entries.values() {
+        if retired.contains_key(&repo_key(&parent.owner, &parent.repo)) {
+            continue;
+        }
         if !can_view(Some(parent), authed) {
             continue;
         }
@@ -498,9 +509,12 @@ async fn resolve_visible(
     repo: &str,
     authed: bool,
 ) -> Option<Resolved> {
-    let entries = state.console.entries().await;
-    let known = known_repo_names(&state.job_store, &entries).await;
+    let (entries, retired) = state.console.registry_state().await;
     let key = repo_key(owner, repo);
+    if retired.contains_key(&key) {
+        return None;
+    }
+    let known = known_repo_names(&state.job_store, &entries, &retired).await;
     let (o, r) = known.get(&key).cloned()?;
     let entry = entries
         .get(&key)
@@ -535,10 +549,10 @@ pub async fn list_repos(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         return denied;
     }
     let authed = eval.has_policy("ci:repos.private.read");
-    let entries = state.console.entries().await;
-    let known = known_repo_names(&state.job_store, &entries).await;
+    let (entries, retired) = state.console.registry_state().await;
+    let known = known_repo_names(&state.job_store, &entries, &retired).await;
     let jobs = state.job_store.list_jobs().await;
-    let parents = parents_index(&entries, authed);
+    let parents = parents_index(&entries, &retired, authed);
     let ttl = state.console.metadata_ttl();
 
     let mut repos = Vec::new();
@@ -859,6 +873,122 @@ pub async fn repo_topology(
         stations,
         branches,
         trains,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PruneReposRequest {
+    #[serde(default)]
+    pub repos: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetireRepoResponse {
+    pub retired: String,
+    pub fabric_rev: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneReposResponse {
+    pub retired: Vec<String>,
+    pub fabric_rev: u64,
+}
+
+fn require_repo_admin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let eval = super::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        headers,
+        None,
+    );
+    if eval.is_admin_api_key {
+        return None;
+    }
+    if eval.is_uninvited {
+        return Some(super::platform_auth::authorization_denied_response());
+    }
+    if eval.passkey_enrollment_required {
+        return Some(super::platform_auth::passkey_enrollment_required_response());
+    }
+    if eval.invite_bound {
+        let has_admin_role = eval.is_platform_admin()
+            || eval.session_dto.active_roles.iter().any(|r| {
+                matches!(
+                    r.id.as_str(),
+                    crate::auth::ADMIN_TIMED_ROLE_ID | crate::auth::SUPER_OPERATOR_ROLE_ID
+                )
+            });
+        if has_admin_role {
+            return None;
+        }
+        return Some(super::platform_auth::authorization_denied_response());
+    }
+    Some(super::platform_auth::authentication_required_response())
+}
+
+/// `DELETE /api/repos/{owner}/{repo}`
+pub async fn retire_repo_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    if let Some(denied) = require_repo_admin(&state, &headers) {
+        return denied;
+    }
+    let full = format!("{owner}/{repo}");
+    if !is_safe_repo_name(&full) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({
+                "error": "Invalid repository name",
+                "repository": full,
+            }),
+        );
+    }
+    state
+        .console
+        .attach_storage(Arc::clone(state.job_store.storage()));
+    let _ = state.console.retire_repo(&owner, &repo).await;
+    json_ok(&RetireRepoResponse {
+        retired: full,
+        fabric_rev: state.console.fabric_rev().await,
+    })
+}
+
+/// `POST /api/repos/prune`
+pub async fn prune_repos_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(denied) = require_repo_admin(&state, &headers) {
+        return denied;
+    }
+    let req = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        PruneReposRequest::default()
+    } else {
+        match serde_json::from_slice::<PruneReposRequest>(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({
+                        "error": format!("Invalid JSON body: {err}"),
+                    }),
+                );
+            }
+        }
+    };
+    state
+        .console
+        .attach_storage(Arc::clone(state.job_store.storage()));
+    let retired = state
+        .console
+        .prune_repos(&state.job_store, &req.repos)
+        .await;
+    json_ok(&PruneReposResponse {
+        retired,
+        fabric_rev: state.console.fabric_rev().await,
     })
 }
 

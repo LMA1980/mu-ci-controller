@@ -243,17 +243,31 @@ pub fn repo_key(owner: &str, repo: &str) -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Registry {
+pub struct Registry {
     #[serde(default)]
-    fabric_rev: u64,
+    pub fabric_rev: u64,
     #[serde(default)]
-    repos: BTreeMap<String, RepoEntry>,
+    pub repos: BTreeMap<String, RepoEntry>,
+    #[serde(default)]
+    pub retired_repos: BTreeMap<String, DateTime<Utc>>,
 }
 
 impl Registry {
     fn bump(&mut self) -> u64 {
         self.fabric_rev = self.fabric_rev.saturating_add(1);
         self.fabric_rev
+    }
+
+    fn retire_key(&mut self, key: String, now: DateTime<Utc>) -> bool {
+        let removed = self.repos.remove(&key).is_some();
+        let inserted = match self.retired_repos.entry(key) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(now);
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        };
+        removed || inserted
     }
 }
 
@@ -307,6 +321,8 @@ pub struct ConsoleConfig {
     pub cache_file: Option<PathBuf>,
     /// How long resolved metadata / submodules stay fresh without a triggering push.
     pub metadata_ttl: Duration,
+    /// Optional `owner/repo` entries retired on startup (seeded from `ACTION_RUNNER_RETIRED_REPOS`).
+    pub retired_repos: Vec<String>,
 }
 
 impl Default for ConsoleConfig {
@@ -317,8 +333,25 @@ impl Default for ConsoleConfig {
             workspace_dir: None,
             cache_file: None,
             metadata_ttl: Duration::from_secs(6 * 3600),
+            retired_repos: Vec::new(),
         }
     }
+}
+
+pub(crate) fn parse_retired_repos(raw: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in raw.split(',') {
+        let trimmed = item.trim();
+        if trimmed.is_empty() || !is_safe_repo_name(trimmed) {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if seen.insert(lower) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }
 
 impl ConsoleConfig {
@@ -326,6 +359,7 @@ impl ConsoleConfig {
     ///
     /// - `ACTION_RUNNER_GITHUB_API_URL` (default `https://api.github.com`, `off` disables)
     /// - `ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS` (default `21600`)
+    /// - `ACTION_RUNNER_RETIRED_REPOS` (optional comma-separated `owner/repo` list)
     /// - reuses `GITHUB_TOKEN` from [`Config`].
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
@@ -341,12 +375,16 @@ impl ConsoleConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(6 * 3600));
+        let retired_repos = std::env::var("ACTION_RUNNER_RETIRED_REPOS")
+            .map(|raw| parse_retired_repos(&raw))
+            .unwrap_or_default();
         Self {
             github_api_url,
             github_token: config.github_token.clone(),
             workspace_dir: Some(config.workspace_dir.clone()),
             cache_file: Some(default_cache_file(&config.workspace_dir)),
             metadata_ttl,
+            retired_repos,
         }
     }
 }
@@ -393,12 +431,46 @@ impl ConsoleState {
                 .map_err(|e| warn!(error = %e, "Console GitHub client disabled"))
                 .ok()
         });
-        let registry = cfg
+        let mut registry = cfg
             .cache_file
             .as_deref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Registry>(&s).ok())
             .unwrap_or_default();
+        let existing_retired = std::mem::take(&mut registry.retired_repos);
+        for (k, retired_at) in existing_retired {
+            let trimmed = k.trim();
+            if is_safe_repo_name(trimmed) {
+                registry
+                    .retired_repos
+                    .entry(trimmed.to_ascii_lowercase())
+                    .or_insert(retired_at);
+            }
+        }
+        let now = Utc::now();
+        for raw in &cfg.retired_repos {
+            if let Some((owner, repo)) = raw.trim().split_once('/') {
+                if is_safe_repo_name(&format!("{owner}/{repo}")) {
+                    registry
+                        .retired_repos
+                        .entry(repo_key(owner, repo))
+                        .or_insert(now);
+                }
+            }
+        }
+        if let Ok(raw_env) = std::env::var("ACTION_RUNNER_RETIRED_REPOS") {
+            for raw in parse_retired_repos(&raw_env) {
+                if let Some((owner, repo)) = raw.split_once('/') {
+                    registry
+                        .retired_repos
+                        .entry(repo_key(owner, repo))
+                        .or_insert(now);
+                }
+            }
+        }
+        registry
+            .repos
+            .retain(|k, _| !registry.retired_repos.contains_key(&k.to_ascii_lowercase()));
         let (events, _) = broadcast::channel(1024);
         Self(Arc::new(Inner {
             cfg,
@@ -443,6 +515,126 @@ impl ConsoleState {
 
     pub async fn entries(&self) -> BTreeMap<String, RepoEntry> {
         self.0.registry.read().await.repos.clone()
+    }
+
+    pub async fn retired_repos(&self) -> BTreeMap<String, DateTime<Utc>> {
+        self.0.registry.read().await.retired_repos.clone()
+    }
+
+    pub(crate) async fn registry_state(
+        &self,
+    ) -> (BTreeMap<String, RepoEntry>, BTreeMap<String, DateTime<Utc>>) {
+        let reg = self.0.registry.read().await;
+        (reg.repos.clone(), reg.retired_repos.clone())
+    }
+
+    pub async fn is_retired(&self, owner: &str, repo: &str) -> bool {
+        let key = repo_key(owner, repo);
+        self.0
+            .registry
+            .read()
+            .await
+            .retired_repos
+            .contains_key(&key)
+    }
+
+    /// Marks `owner/repo` as retired, evicts it from active `repos`, bumps `fabric_rev`,
+    /// and persists `Registry` (leaving historical jobs in `JobStore` / `MuObserve` untouched).
+    /// Returns `true` when registry state changed.
+    pub async fn retire_repo(&self, owner: &str, repo: &str) -> bool {
+        let full = format!("{owner}/{repo}");
+        if !is_safe_repo_name(&full) {
+            return false;
+        }
+        let key = repo_key(owner, repo);
+        let changed = {
+            let mut reg = self.0.registry.write().await;
+            if reg.retire_key(key, Utc::now()) {
+                reg.bump();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.persist().await;
+        }
+        changed
+    }
+
+    /// Probes all currently known active repositories against GitHub (when configured),
+    /// retiring every `404 NotFound` repository plus any explicit `owner/repo` entries.
+    pub async fn prune_repos(
+        &self,
+        job_store: &JobStore,
+        explicit_repos: &[String],
+    ) -> Vec<String> {
+        self.attach_storage(Arc::clone(job_store.storage()));
+        let (entries, retired_before) = self.registry_state().await;
+        let known = api::known_repo_names(job_store, &entries, &retired_before).await;
+
+        let mut to_retire: BTreeMap<String, String> = BTreeMap::new();
+        for raw in explicit_repos {
+            let trimmed = raw.trim();
+            if !is_safe_repo_name(trimmed) {
+                continue;
+            }
+            if let Some((owner, repo)) = trimmed.split_once('/') {
+                let key = repo_key(owner, repo);
+                if !retired_before.contains_key(&key) || entries.contains_key(&key) {
+                    let display = known
+                        .get(&key)
+                        .map(|(o, r)| format!("{o}/{r}"))
+                        .unwrap_or_else(|| format!("{owner}/{repo}"));
+                    to_retire.entry(key).or_insert(display);
+                }
+            }
+        }
+
+        if let Some(gh) = self.0.github.as_ref() {
+            for (key, (owner, repo)) in &known {
+                if to_retire.contains_key(key) {
+                    continue;
+                }
+                if !gh.has_token() {
+                    if let Some(entry) = entries.get(key) {
+                        if matches!(
+                            entry.visibility,
+                            Some(Visibility::Private | Visibility::Internal)
+                        ) {
+                            continue;
+                        }
+                    }
+                }
+                if matches!(gh.get_repo(owner, repo).await, Err(GitHubError::NotFound)) {
+                    to_retire.insert(key.clone(), format!("{owner}/{repo}"));
+                }
+            }
+        }
+
+        if to_retire.is_empty() {
+            return Vec::new();
+        }
+
+        let retired_list = {
+            let mut reg = self.0.registry.write().await;
+            let now = Utc::now();
+            let mut retired = Vec::new();
+            for (key, display) in to_retire {
+                if reg.retire_key(key, now) {
+                    retired.push(display);
+                }
+            }
+            if !retired.is_empty() {
+                reg.bump();
+            }
+            retired
+        };
+
+        if !retired_list.is_empty() {
+            self.persist().await;
+        }
+        retired_list
     }
 
     #[must_use]
@@ -502,6 +694,27 @@ impl ConsoleState {
         let Some((owner, repo)) = full.split_once('/') else {
             return;
         };
+        let key = repo_key(owner, repo);
+        let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
+        if event == "repository" && action == "deleted" {
+            let _ = self.retire_repo(owner, repo).await;
+            return;
+        }
+        if event == "repository" && action == "renamed" {
+            if let Some(old_name) = payload
+                .pointer("/changes/repository/name/from")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                if !old_name.is_empty()
+                    && !old_name.eq_ignore_ascii_case(repo)
+                    && is_safe_repo_name(&format!("{owner}/{old_name}"))
+                {
+                    let _ = self.retire_repo(owner, old_name).await;
+                }
+            }
+        }
+
         let repo_obj = payload.get("repository").cloned().unwrap_or(Value::Null);
         let visibility = Visibility::from_repository(&repo_obj);
         let payload_default = repo_obj
@@ -511,6 +724,9 @@ impl ConsoleState {
             .or_else(|| repo_obj.get("master_branch").and_then(Value::as_str))
             .map(str::to_string);
 
+        let should_unretire = matches!(event, "push" | "pull_request")
+            || (event == "repository" && matches!(action, "created" | "unarchived" | "renamed"));
+
         let jobs = job_store.list_jobs().await;
         let mut pending: Vec<(ConsoleEventKind, Value)> = Vec::new();
         let mut refresh: Option<Option<String>> = None;
@@ -519,10 +735,23 @@ impl ConsoleState {
 
         {
             let mut reg = self.0.registry.write().await;
+            let mut unretired = false;
+            if reg.retired_repos.contains_key(&key) {
+                if !should_unretire {
+                    return;
+                }
+                reg.retired_repos.remove(&key);
+                changed = true;
+                unretired = true;
+            }
+            let is_new_repo = !reg.repos.contains_key(&key);
             let entry = reg
                 .repos
-                .entry(repo_key(owner, repo))
+                .entry(key)
                 .or_insert_with(|| RepoEntry::new(owner, repo));
+            if is_new_repo && event == "repository" {
+                changed = true;
+            }
             if visibility.is_some() && entry.visibility != visibility {
                 entry.visibility = visibility;
                 changed = true;
@@ -608,6 +837,9 @@ impl ConsoleState {
             if !pending.is_empty() {
                 changed = true;
             }
+            if pending.is_empty() && (unretired || (is_new_repo && event == "repository")) {
+                reg.bump();
+            }
             for (_, data) in pending.iter_mut() {
                 let rev = reg.bump();
                 data["fabric_rev"] = json!(rev);
@@ -656,6 +888,20 @@ impl ConsoleState {
     /// workflow stations, via the GitHub API first and the local CI clone second.
     pub async fn refresh_repo(&self, owner: &str, repo: &str, sha_hint: Option<String>) {
         let key = repo_key(owner, repo);
+        if self.is_retired(owner, repo).await {
+            let removed = {
+                let mut reg = self.0.registry.write().await;
+                let was_present = reg.repos.remove(&key).is_some();
+                if was_present {
+                    reg.bump();
+                }
+                was_present
+            };
+            if removed {
+                self.persist().await;
+            }
+            return;
+        }
         let (mut visibility, mut default_branch) = {
             let reg = self.0.registry.read().await;
             reg.repos
@@ -673,6 +919,14 @@ impl ConsoleState {
                         default_branch = meta.default_branch.clone();
                     }
                     repo_visible_via_api = true;
+                }
+                Err(GitHubError::NotFound) if gh.has_token() => {
+                    info!(
+                        repo = %key,
+                        "Repository returned 404 NotFound from authenticated GitHub API; retiring"
+                    );
+                    let _ = self.retire_repo(owner, repo).await;
+                    return;
                 }
                 Err(GitHubError::NotFound) => {
                     debug!(repo = %key, "Repository metadata not visible to the API token");
@@ -760,32 +1014,47 @@ impl ConsoleState {
             }
         }
 
-        {
+        let retired_now = {
             let mut reg = self.0.registry.write().await;
-            let entry = reg
-                .repos
-                .entry(key.clone())
-                .or_insert_with(|| RepoEntry::new(owner, repo));
-            if visibility.is_some() {
-                entry.visibility = visibility;
+            if reg.retired_repos.contains_key(&key) {
+                let removed = reg.repos.remove(&key).is_some();
+                if removed {
+                    reg.bump();
+                }
+                Some(removed)
+            } else {
+                let entry = reg
+                    .repos
+                    .entry(key.clone())
+                    .or_insert_with(|| RepoEntry::new(owner, repo));
+                if visibility.is_some() {
+                    entry.visibility = visibility;
+                }
+                if default_branch.is_some() {
+                    entry.default_branch = default_branch;
+                }
+                let mut graph_changed = false;
+                if let Some(subs) = submodules {
+                    graph_changed = entry.submodules != subs;
+                    entry.submodules = subs;
+                    entry.submodules_ref = Some(git_ref.clone());
+                }
+                if let Some(st) = stations {
+                    graph_changed |= entry.stations != st;
+                    entry.stations = st;
+                }
+                entry.metadata_refreshed_at = Some(Utc::now());
+                if graph_changed {
+                    reg.bump();
+                }
+                None
             }
-            if default_branch.is_some() {
-                entry.default_branch = default_branch;
+        };
+        if let Some(removed) = retired_now {
+            if removed {
+                self.persist().await;
             }
-            let mut graph_changed = false;
-            if let Some(subs) = submodules {
-                graph_changed = entry.submodules != subs;
-                entry.submodules = subs;
-                entry.submodules_ref = Some(git_ref.clone());
-            }
-            if let Some(st) = stations {
-                graph_changed |= entry.stations != st;
-                entry.stations = st;
-            }
-            entry.metadata_refreshed_at = Some(Utc::now());
-            if graph_changed {
-                reg.bump();
-            }
+            return;
         }
         info!(repo = %key, git_ref = %git_ref, "Console repository metadata refreshed");
         self.persist().await;
@@ -957,9 +1226,13 @@ impl ConsoleState {
         {
             let mut reg = self.0.registry.write().await;
             for (repo_name, mut data) in stage_events {
+                let key = repo_name.to_ascii_lowercase();
+                if reg.retired_repos.contains_key(&key) {
+                    continue;
+                }
                 let public = reg
                     .repos
-                    .get(&repo_name.to_ascii_lowercase())
+                    .get(&key)
                     .map(RepoEntry::is_public)
                     .unwrap_or(false);
                 data["fabric_rev"] = json!(reg.bump());
@@ -979,9 +1252,9 @@ impl ConsoleState {
     /// metadata is missing or stale.
     pub async fn warm_up(&self, job_store: &JobStore) {
         self.attach_storage(Arc::clone(job_store.storage()));
-        let entries = self.entries().await;
+        let (entries, retired) = self.registry_state().await;
         let ttl = self.metadata_ttl();
-        for (owner, repo) in api::known_repo_names(job_store, &entries)
+        for (owner, repo) in api::known_repo_names(job_store, &entries, &retired)
             .await
             .into_values()
         {
@@ -1015,8 +1288,26 @@ impl ConsoleState {
                 if rem.fabric_rev > reg.fabric_rev {
                     reg.fabric_rev = rem.fabric_rev;
                 }
+                for (k, retired_at) in rem.retired_repos {
+                    let trimmed = k.trim();
+                    if is_safe_repo_name(trimmed) {
+                        let norm = trimmed.to_ascii_lowercase();
+                        reg.retired_repos
+                            .entry(norm)
+                            .and_modify(|cur| {
+                                if retired_at > *cur {
+                                    *cur = retired_at;
+                                }
+                            })
+                            .or_insert(retired_at);
+                    }
+                }
                 for (k, rem_entry) in rem.repos {
-                    match reg.repos.get_mut(&k) {
+                    let norm = k.to_ascii_lowercase();
+                    if reg.retired_repos.contains_key(&norm) {
+                        continue;
+                    }
+                    match reg.repos.get_mut(&norm) {
                         Some(existing) => {
                             if existing.visibility.is_none() && rem_entry.visibility.is_some() {
                                 existing.visibility = rem_entry.visibility;
@@ -1041,11 +1332,15 @@ impl ConsoleState {
                             }
                         }
                         None => {
-                            reg.repos.insert(k, rem_entry);
+                            reg.repos.insert(norm, rem_entry);
                         }
                     }
                 }
             }
+            let reg_mut = &mut *reg;
+            reg_mut
+                .repos
+                .retain(|k, _| !reg_mut.retired_repos.contains_key(&k.to_ascii_lowercase()));
 
             // Also synthesize RepoEntry and feat/** BranchEntry sidings from branch_snapshots & jobs
             let mut discovered_refs: Vec<(String, String, Option<String>)> = Vec::new();
@@ -1080,6 +1375,9 @@ impl ConsoleState {
                     continue;
                 };
                 let key = repo_key(owner, repo);
+                if reg.retired_repos.contains_key(&key) {
+                    continue;
+                }
                 let entry = reg
                     .repos
                     .entry(key)
@@ -1658,5 +1956,47 @@ mod tests {
         assert!(push_touches_topology(&p, &subs));
         let p = json!({});
         assert!(push_touches_topology(&p, &subs));
+    }
+
+    #[test]
+    fn parse_retired_repos_normalizes_deduplicates_and_filters_invalid() {
+        let parsed = parse_retired_repos(
+            " LMA1980/ActionRunner-controller , lma1980/actionrunner-controller , , ../bad , LMA1980/k3-core ",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "LMA1980/ActionRunner-controller".to_string(),
+                "LMA1980/k3-core".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_serde_defaults_retired_repos() {
+        let legacy: Registry =
+            serde_json::from_str(r#"{"fabric_rev": 7, "repos": {}}"#).expect("deserialize");
+        assert_eq!(legacy.fabric_rev, 7);
+        assert!(legacy.retired_repos.is_empty());
+
+        let mut reg = Registry::default();
+        reg.retired_repos
+            .insert("lma1980/retired-repo".to_string(), Utc::now());
+        let encoded = serde_json::to_string(&reg).expect("serialize");
+        let decoded: Registry = serde_json::from_str(&encoded).expect("roundtrip");
+        assert!(decoded.retired_repos.contains_key("lma1980/retired-repo"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn github_client_has_token_reflects_non_empty_token() {
+        let anon = GitHubClient::new("https://api.github.com", None).expect("client");
+        assert!(!anon.has_token());
+        let blank =
+            GitHubClient::new("https://api.github.com", Some("   ".to_string())).expect("client");
+        assert!(!blank.has_token());
+        let authed = GitHubClient::new("https://api.github.com", Some("ghp_tok".to_string()))
+            .expect("client");
+        assert!(authed.has_token());
     }
 }

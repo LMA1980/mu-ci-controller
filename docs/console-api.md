@@ -221,6 +221,7 @@ Each frame is `event: <kind>` followed by `data: <json>`. Every payload carries 
 | `GITHUB_TOKEN` | unset | Reused for read-only metadata, `.gitmodules` and workflow lookups |
 | `ACTION_RUNNER_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL. `off` disables API lookups (local-clone fallback only) |
 | `ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS` | `21600` | Freshness window for cached metadata and submodules |
+| `ACTION_RUNNER_RETIRED_REPOS` | unset | Comma-separated `owner/repo` keys retired on startup (excluded from active console APIs without mutating historical job records) |
 | `ACTION_RUNNER_PROXY_SECRET` | unset | Shared secret validating trusted edge OAuth headers (`X-Proxy-Secret`, `X-Forwarded-User`) |
 | `ACTION_RUNNER_INVITE_SIGNING_KEY` | unset | HMAC key signing single-use `PinnedBaseline` invite tokens |
 | `ACTION_RUNNER_BOOTSTRAP_ADMINS` | unset | Comma-separated GitHub logins seeded with dormant `platform-admin` rights |
@@ -244,6 +245,9 @@ Each frame is `event: <kind>` followed by `data: <json>`. Every payload carries 
   - `GET /api/auth/users`, `PUT|POST /api/auth/users/{github_login}/roles`, `DELETE /api/auth/users/{github_login}`
   - `DELETE /api/auth/users/{github_login}/passkeys`, `POST|DELETE /api/auth/users/{github_login}/passkeys/reset`
   - `GET|POST /api/auth/invites`, `DELETE /api/auth/invites/{invite_id}`
+- **Repository Retirement Endpoints (`AdminApiKey` or `platform-admin` / `super-operator`)**:
+  - `DELETE /api/repos/{owner}/{repo}` retires `owner/repo` from active console hydration/APIs while preserving historical job records in `JobStore` and `MuObserve`, returning `{"retired": "owner/repo", "fabric_rev": ...}`.
+  - `POST /api/repos/prune` probes known repositories via GitHub REST (when configured), retires every `404 NotFound` repository plus any explicit `repos: [...]` entries from the optional JSON body, persists `Registry`, and returns `{"retired": [...], "fabric_rev": ...}`.
 - **Internal Auth Snapshot Feed**: `GET /api/internal/auth/snapshot` returns canonical folios, roles, `role_folio_index`, and bound users with `ETag` (`"rev-<N>"`) and `304 Not Modified` support on matching `If-None-Match`.
 - **Break-Glass Host CLI Reset**: `mu-ci-controller reset-passkeys <github_login>` clears stored Passkeys and active timed/elective leases for `<github_login>` directly against `platform_auth.json`.
 

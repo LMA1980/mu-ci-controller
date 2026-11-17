@@ -386,6 +386,23 @@ pub async fn handle_webhook(
         ));
     }
 
+    if event == "repository" {
+        let action = payload
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("unknown");
+        info!(repo = %repo_name, action = %action, "GitHub repository lifecycle event processed");
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "observed",
+                "event": "repository",
+                "action": action,
+                "repository": repo_name
+            })),
+        ));
+    }
+
     let default_clone_url = payload
         .get("repository")
         .and_then(|r| r.get("clone_url"))
