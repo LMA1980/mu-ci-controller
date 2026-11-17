@@ -2248,3 +2248,634 @@ async fn anonymous_job_sse_streams_sanitized_log_init_and_shared_storage_deltas(
         "expected sanitized delta chunk from shared storage poll, got: {chunk_text}"
     );
 }
+
+// ============================================================================
+// Repository Retirement & NotFound Auto-Retirement Tests
+// ============================================================================
+
+async fn spawn_retirement_github_mock(active_repos: Vec<&'static str>) -> String {
+    let mut repos: BTreeMap<&'static str, Value> = BTreeMap::new();
+    for name in active_repos {
+        repos.insert(
+            name,
+            json!({"private": false, "visibility": "public", "default_branch": "main"}),
+        );
+    }
+    let repos = Arc::new(repos);
+
+    let app = Router::new()
+        .route(
+            "/repos/{owner}/{repo}",
+            get({
+                let repos = repos.clone();
+                move |axum::extract::Path((o, r)): axum::extract::Path<(String, String)>| {
+                    let repos = repos.clone();
+                    async move {
+                        match repos.get(format!("{o}/{r}").as_str()) {
+                            Some(v) => (StatusCode::OK, v.to_string()),
+                            None => (StatusCode::NOT_FOUND, "{}".to_string()),
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/{owner}/{repo}/contents/{*path}",
+            get(|| async { (StatusCode::NOT_FOUND, "{}".to_string()) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn authenticated_github_not_found_auto_retires_stale_local_clone_preserving_job_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().to_path_buf();
+    let cache_file = ws.join("logs").join("console_registry.json");
+    // Create a stale local git clone on disk that previously caused local_clone fallback.
+    let stale_git_dir = ws
+        .join("repos")
+        .join("LMA1980")
+        .join("stale-local")
+        .join(".git");
+    std::fs::create_dir_all(&stale_git_dir).unwrap();
+    std::fs::write(stale_git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    let api = spawn_retirement_github_mock(vec!["LMA1980/active-repo"]).await;
+    let console = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api),
+        github_token: Some("ghp_test_token".to_string()),
+        workspace_dir: Some(ws.clone()),
+        cache_file: Some(cache_file.clone()),
+        ..ConsoleConfig::default()
+    });
+
+    let mut cfg = test_config(Some(API_KEY));
+    cfg.workspace_dir = ws;
+    cfg.github_token = Some("ghp_test_token".to_string());
+    let job_store = JobStore::new(100, None);
+    console.attach_storage(Arc::clone(job_store.storage()));
+
+    completed_job(
+        &job_store,
+        "job-stale-1",
+        "LMA1980/stale-local",
+        "refs/heads/main",
+        SHA_CORE,
+        5,
+        None,
+    )
+    .await;
+    completed_job(
+        &job_store,
+        "job-active-1",
+        "LMA1980/active-repo",
+        "refs/heads/main",
+        SHA_CHILD,
+        3,
+        None,
+    )
+    .await;
+
+    console.refresh_repo("LMA1980", "active-repo", None).await;
+    console.refresh_repo("LMA1980", "stale-local", None).await;
+
+    assert!(console.is_retired("LMA1980", "stale-local").await);
+    assert!(console.entry("LMA1980", "stale-local").await.is_none());
+    assert!(!console.is_retired("LMA1980", "active-repo").await);
+    assert!(console.entry("LMA1980", "active-repo").await.is_some());
+
+    // Calling refresh_repo again returns early without resurrecting from local_clone.
+    console.refresh_repo("LMA1980", "stale-local", None).await;
+    assert!(console.entry("LMA1980", "stale-local").await.is_none());
+
+    // Persisted in console_registry.json AND mirrored into ControllerStorage (__ar_console_registry__).
+    let disk_json: mu_ci_controller::console::Registry =
+        serde_json::from_str(&std::fs::read_to_string(&cache_file).unwrap()).unwrap();
+    assert!(disk_json.retired_repos.contains_key("lma1980/stale-local"));
+    let stored_json: mu_ci_controller::console::Registry = serde_json::from_str(
+        &job_store
+            .storage()
+            .load_console_registry()
+            .expect("mirrored registry"),
+    )
+    .unwrap();
+    assert!(stored_json
+        .retired_repos
+        .contains_key("lma1980/stale-local"));
+
+    // Historical jobs in JobStore remain untouched (Decision A1).
+    let all_jobs = job_store.list_jobs().await;
+    assert!(
+        all_jobs
+            .iter()
+            .any(|j| j.job.repo_name == "LMA1980/stale-local"),
+        "historical jobs in JobStore must remain intact"
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console,
+    });
+    let app = create_router(state);
+
+    let (st_repos, repos_json) = get_json(&app, "/api/repos", Some(API_KEY)).await;
+    assert_eq!(st_repos, StatusCode::OK);
+    assert!(find_repo(&repos_json, "active-repo").is_some());
+    assert!(find_repo(&repos_json, "stale-local").is_none());
+
+    let (st_sum, _) = get_json(
+        &app,
+        "/api/repos/LMA1980/stale-local/summary",
+        Some(API_KEY),
+    )
+    .await;
+    assert_eq!(st_sum, StatusCode::NOT_FOUND);
+    let (st_top, _) = get_json(
+        &app,
+        "/api/repos/LMA1980/stale-local/topology",
+        Some(API_KEY),
+    )
+    .await;
+    assert_eq!(st_top, StatusCode::NOT_FOUND);
+
+    // Both /api/queue and /api/ci/queue exclude retired repos from recent_jobs.
+    for queue_uri in ["/api/queue", "/api/ci/queue"] {
+        let (st_q, q_json) = get_json(&app, queue_uri, Some(API_KEY)).await;
+        assert_eq!(st_q, StatusCode::OK);
+        let recent = q_json["recent_jobs"].as_array().unwrap();
+        assert!(recent
+            .iter()
+            .any(|r| r["job"]["repo_name"] == "LMA1980/active-repo"));
+        assert!(!recent
+            .iter()
+            .any(|r| r["job"]["repo_name"] == "LMA1980/stale-local"));
+    }
+}
+
+#[tokio::test]
+async fn sync_from_storage_does_not_resurrect_retired_repos_from_snapshots_or_jobs() {
+    let storage: Arc<dyn mu_ci_controller::storage_backend::ControllerStorage> =
+        Arc::new(mu_ci_controller::storage_backend::InMemoryStorage::open());
+    let leader_store = JobStore::with_storage(100, None, Arc::clone(&storage));
+
+    completed_job(
+        &leader_store,
+        "job-sync-ret-1",
+        "LMA1980/deleted-legacy",
+        "refs/heads/feat/old-branch",
+        SHA_CORE,
+        10,
+        None,
+    )
+    .await;
+    completed_job(
+        &leader_store,
+        "job-sync-act-1",
+        "LMA1980/parent",
+        "refs/heads/main",
+        SHA_CHILD,
+        5,
+        None,
+    )
+    .await;
+
+    let leader_console = ConsoleState::default();
+    leader_console.attach_storage(Arc::clone(&storage));
+    assert!(
+        leader_console
+            .retire_repo("LMA1980", "deleted-legacy")
+            .await
+    );
+
+    // Standby hydrates from shared storage where branch_snapshots and jobs_history still hold
+    // historical records for LMA1980/deleted-legacy.
+    let standby_store = JobStore::with_storage(100, None, Arc::clone(&storage));
+    let _ = standby_store.rehydrate_from_storage(false).await;
+    let standby_console = ConsoleState::default();
+    standby_console
+        .sync_from_storage(&standby_store, true)
+        .await;
+
+    assert!(
+        standby_console
+            .is_retired("LMA1980", "deleted-legacy")
+            .await
+    );
+    assert!(standby_console
+        .entry("LMA1980", "deleted-legacy")
+        .await
+        .is_none());
+    assert!(standby_console.entry("LMA1980", "parent").await.is_some());
+
+    let (entries, retired) = (
+        standby_console.entries().await,
+        standby_console.retired_repos().await,
+    );
+    let known =
+        mu_ci_controller::console::api::known_repo_names(&standby_store, &entries, &retired).await;
+    assert!(!known.contains_key("lma1980/deleted-legacy"));
+    assert!(known.contains_key("lma1980/parent"));
+
+    // Underlying branch_snapshots and jobs_history remain untouched.
+    assert!(storage
+        .load_branch_snapshots(Some("LMA1980/deleted-legacy"), None)
+        .iter()
+        .any(|s| s.repo_name == "LMA1980/deleted-legacy"));
+    assert!(standby_store
+        .list_jobs()
+        .await
+        .iter()
+        .any(|j| j.job.repo_name == "LMA1980/deleted-legacy"));
+}
+
+#[tokio::test]
+async fn admin_delete_prune_and_repository_lifecycle_webhooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api = spawn_retirement_github_mock(vec![
+        "LMA1980/parent",
+        "LMA1980/child",
+        "LMA1980/parent-renamed",
+    ])
+    .await;
+    let console = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api),
+        github_token: Some("ghp_test_token".to_string()),
+        retired_repos: vec!["LMA1980/startup-retired".to_string()],
+        ..ConsoleConfig::default()
+    });
+    console.refresh_repo("LMA1980", "parent", None).await;
+    console.refresh_repo("LMA1980", "child", None).await;
+
+    let mut cfg = test_config(Some(API_KEY));
+    cfg.workspace_dir = tmp.path().to_path_buf();
+    cfg.proxy_secret = Some(PROXY_SECRET.to_string());
+    cfg.invite_signing_key = Some(INVITE_KEY.to_string());
+    cfg.bootstrap_admins = vec!["LMA1980".to_string()];
+    cfg.github_token = Some("ghp_test_token".to_string());
+
+    let job_store = JobStore::from_config(100, &cfg);
+    completed_job(
+        &job_store,
+        "job-miss-a",
+        "LMA1980/missing-a",
+        "refs/heads/main",
+        SHA_CORE,
+        5,
+        None,
+    )
+    .await;
+    completed_job(
+        &job_store,
+        "job-miss-b",
+        "LMA1980/missing-b",
+        "refs/heads/main",
+        SHA_SECRET,
+        4,
+        None,
+    )
+    .await;
+    completed_job(
+        &job_store,
+        "job-startup-ret",
+        "LMA1980/startup-retired",
+        "refs/heads/main",
+        SHA_CHILD,
+        3,
+        None,
+    )
+    .await;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console,
+    });
+    let app = create_router(state.clone());
+
+    assert!(state.console.is_retired("LMA1980", "startup-retired").await);
+
+    // 1. Auth gating on DELETE /api/repos/{owner}/{repo} & POST /api/repos/prune
+    let (st_anon_del, _, _) =
+        send_req(&app, "DELETE", "/api/repos/LMA1980/missing-a", &[], None).await;
+    assert_eq!(st_anon_del, StatusCode::UNAUTHORIZED);
+    let (st_anon_prune, _, _) = send_req(&app, "POST", "/api/repos/prune", &[], None).await;
+    assert_eq!(st_anon_prune, StatusCode::UNAUTHORIZED);
+
+    // Non-admin baseline operator (enrolled passkey, not elevated to platform-admin) -> 403
+    let bearer_auth = format!("Bearer {API_KEY}");
+    let api_hdrs = [("Authorization", bearer_auth.as_str())];
+    let (st_inv, inv_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &api_hdrs,
+        Some(json!({ "ttl_seconds": 3600, "note": "baseline operator" })),
+    )
+    .await;
+    assert_eq!(st_inv, StatusCode::CREATED);
+    let inv_tok = inv_json["invite_token"].as_str().unwrap();
+    let op_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "baseline-op"),
+    ];
+    let (st_red, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &op_hdrs,
+        Some(json!({ "invite_token": inv_tok })),
+    )
+    .await;
+    assert_eq!(st_red, StatusCode::OK);
+    let op_auth = TestVirtualAuthenticator::new_synced(77, b"cred-baseline-op");
+    enroll_first_passkey(&app, &op_hdrs, &op_auth, "Op Passkey").await;
+
+    let (st_op_del, _, _) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/missing-a",
+        &op_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_op_del, StatusCode::FORBIDDEN);
+    let (st_op_prune, _, _) = send_req(&app, "POST", "/api/repos/prune", &op_hdrs, None).await;
+    assert_eq!(st_op_prune, StatusCode::FORBIDDEN);
+
+    // 2. Elevated platform-admin DELETE /api/repos/{owner}/{repo} -> 200 OK
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+    let admin_auth = TestVirtualAuthenticator::new_synced(78, b"cred-admin-retire");
+    enroll_first_passkey(&app, &admin_hdrs, &admin_auth, "Admin Passkey").await;
+    let admin_cookie = elevate_admin_with_passkey(&app, &admin_hdrs, &admin_auth).await;
+    let admin_elevated_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", admin_cookie.as_str()),
+    ];
+
+    let (st_del, del_json, del_txt) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/missing-a",
+        &admin_elevated_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_del, StatusCode::OK, "DELETE failed: {del_txt}");
+    assert_eq!(del_json["retired"], "LMA1980/missing-a");
+    assert!(del_json["fabric_rev"].as_u64().unwrap() >= 1);
+    assert!(state.console.is_retired("LMA1980", "missing-a").await);
+
+    let (st_sum, _) = get_json(&app, "/api/repos/LMA1980/missing-a/summary", Some(API_KEY)).await;
+    assert_eq!(st_sum, StatusCode::NOT_FOUND);
+
+    // 3. AdminApiKey POST /api/repos/prune with empty body probes known repos and retires 404s
+    let (st_prune, prune_json, prune_txt) =
+        send_req(&app, "POST", "/api/repos/prune", &api_hdrs, None).await;
+    assert_eq!(st_prune, StatusCode::OK, "prune failed: {prune_txt}");
+    let pruned: Vec<&str> = prune_json["retired"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(pruned, vec!["LMA1980/missing-b"]);
+    assert!(state.console.is_retired("LMA1980", "missing-b").await);
+    assert!(!state.console.is_retired("LMA1980", "parent").await);
+
+    // Explicit repos in JSON body are also retired; subsequent empty prune returns [].
+    let (st_prune_exp, prune_exp_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/repos/prune",
+        &api_hdrs,
+        Some(json!({ "repos": ["LMA1980/explicit-old"] })),
+    )
+    .await;
+    assert_eq!(st_prune_exp, StatusCode::OK);
+    assert_eq!(prune_exp_json["retired"], json!(["LMA1980/explicit-old"]));
+    assert!(state.console.is_retired("LMA1980", "explicit-old").await);
+
+    let (st_prune_idem, prune_idem_json, _) =
+        send_req(&app, "POST", "/api/repos/prune", &api_hdrs, None).await;
+    assert_eq!(st_prune_idem, StatusCode::OK);
+    assert_eq!(prune_idem_json["retired"], json!([]));
+
+    // 4. repository "deleted" and "renamed" webhooks + un-retire on "unarchived"/"push"
+    let st_wh_del = post_webhook(
+        &app,
+        "repository",
+        json!({
+            "action": "deleted",
+            "repository": repo_obj("LMA1980/child", false),
+        }),
+    )
+    .await;
+    assert_eq!(st_wh_del, StatusCode::OK);
+    assert!(state.console.is_retired("LMA1980", "child").await);
+
+    let st_wh_ren = post_webhook(
+        &app,
+        "repository",
+        json!({
+            "action": "renamed",
+            "repository": repo_obj("LMA1980/parent-renamed", false),
+            "changes": {
+                "repository": {
+                    "name": { "from": "parent" }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(st_wh_ren, StatusCode::OK);
+    assert!(state.console.is_retired("LMA1980", "parent").await);
+    assert!(!state.console.is_retired("LMA1980", "parent-renamed").await);
+
+    let (_, after_ren) = get_json(&app, "/api/repos", Some(API_KEY)).await;
+    assert!(find_repo(&after_ren, "parent").is_none());
+    assert!(find_repo(&after_ren, "child").is_none());
+    assert!(find_repo(&after_ren, "parent-renamed").is_some());
+
+    // Valid repository "unarchived" webhook un-retires LMA1980/child
+    let st_wh_unarch = post_webhook(
+        &app,
+        "repository",
+        json!({
+            "action": "unarchived",
+            "repository": repo_obj("LMA1980/child", false),
+        }),
+    )
+    .await;
+    assert_eq!(st_wh_unarch, StatusCode::OK);
+    assert!(!state.console.is_retired("LMA1980", "child").await);
+    let (_, after_unarch) = get_json(&app, "/api/repos", Some(API_KEY)).await;
+    assert!(find_repo(&after_unarch, "child").is_some());
+
+    // Retire LMA1980/child again, verify "archived" does NOT un-retire, then verify valid "push" un-retires
+    assert!(state.console.retire_repo("LMA1980", "child").await);
+    let st_wh_arch = post_webhook(
+        &app,
+        "repository",
+        json!({
+            "action": "archived",
+            "repository": repo_obj("LMA1980/child", false),
+        }),
+    )
+    .await;
+    assert_eq!(st_wh_arch, StatusCode::OK);
+    assert!(state.console.is_retired("LMA1980", "child").await);
+
+    let st_wh_push = post_webhook(
+        &app,
+        "push",
+        json!({
+            "ref": "refs/heads/main",
+            "after": SHA_CHILD,
+            "repository": repo_obj("LMA1980/child", false),
+        }),
+    )
+    .await;
+    assert_eq!(st_wh_push, StatusCode::ACCEPTED);
+    assert!(!state.console.is_retired("LMA1980", "child").await);
+
+    // 5. Elevated super-operator role can also DELETE /api/repos/{owner}/{repo}
+    let (st_elev_so_start, so_start_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/elevate/start",
+        &admin_hdrs,
+        Some(json!({ "role_id": "super-operator" })),
+    )
+    .await;
+    assert_eq!(st_elev_so_start, StatusCode::OK);
+    let so_challenge_id = so_start_json["challenge_id"].as_str().unwrap().to_string();
+    let so_challenge_b64 = so_start_json["options"]["publicKey"]["challenge"]
+        .as_str()
+        .unwrap();
+    let so_challenge_bytes = URL_SAFE_NO_PAD.decode(so_challenge_b64).unwrap();
+    let so_cred =
+        admin_auth.create_assertion_response(&so_challenge_bytes, admin_auth.sign_count + 1);
+    let (st_elev_so_fin, _, so_fin_text, so_cookie_opt) = send_req_with_cookie(
+        &app,
+        "POST",
+        "/api/auth/elevate/finish",
+        &admin_hdrs,
+        Some(json!({
+            "challenge_id": so_challenge_id,
+            "credential": so_cred,
+            "role_id": "super-operator",
+        })),
+    )
+    .await;
+    assert_eq!(
+        st_elev_so_fin,
+        StatusCode::OK,
+        "super-operator elevate failed: {so_fin_text}"
+    );
+    let so_cookie = so_cookie_opt.expect("super-operator cookie");
+    let so_elevated_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", so_cookie.as_str()),
+    ];
+    let (st_so_del, so_del_json, so_del_txt) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/child",
+        &so_elevated_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st_so_del,
+        StatusCode::OK,
+        "super-operator DELETE failed: {so_del_txt}"
+    );
+    assert_eq!(so_del_json["retired"], "LMA1980/child");
+    assert!(state.console.is_retired("LMA1980", "child").await);
+}
+
+#[test]
+fn env_retired_repos_seeds_console_state_on_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(None);
+    cfg.workspace_dir = tmp.path().to_path_buf();
+    std::env::set_var(
+        "ACTION_RUNNER_RETIRED_REPOS",
+        "LMA1980/env-seeded-retired-repo, LMA1980/env-seeded-retired-two",
+    );
+    let console_cfg = ConsoleConfig::from_config(&cfg);
+    std::env::remove_var("ACTION_RUNNER_RETIRED_REPOS");
+    let console = ConsoleState::new(console_cfg);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert!(
+            console
+                .is_retired("LMA1980", "env-seeded-retired-repo")
+                .await
+        );
+        assert!(
+            console
+                .is_retired("LMA1980", "env-seeded-retired-two")
+                .await
+        );
+    });
+}
+
+#[tokio::test]
+async fn unauthenticated_github_client_preserves_history_only_behavior() {
+    let api = spawn_retirement_github_mock(vec!["LMA1980/parent"]).await;
+    let console = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api),
+        github_token: None,
+        ..ConsoleConfig::default()
+    });
+    let state = make_state(Some(API_KEY), console.clone());
+    completed_job(
+        &state.job_store,
+        "job-hist-preserve",
+        "LMA1980/history-only",
+        "refs/heads/main",
+        SHA_CORE,
+        5,
+        None,
+    )
+    .await;
+
+    console.refresh_repo("LMA1980", "history-only", None).await;
+    assert!(
+        !console.is_retired("LMA1980", "history-only").await,
+        "unauthenticated GitHubClient (github_token: None) must not auto-retire on 404"
+    );
+    let entry = console
+        .entry("LMA1980", "history-only")
+        .await
+        .expect("history-only entry must remain cached");
+    assert_eq!(entry.visibility, None);
+
+    let app = create_router(state);
+    let (st, authed) = get_json(&app, "/api/repos", Some(API_KEY)).await;
+    assert_eq!(st, StatusCode::OK);
+    let hist = find_repo(&authed, "history-only").expect("history-only visible to authed callers");
+    assert_eq!(hist["visibility"], Value::Null);
+}

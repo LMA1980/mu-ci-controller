@@ -210,11 +210,9 @@ fn build_test_state(
     let (tx, _rx) = mpsc::channel(32);
     let (log_broadcaster, _) = broadcast::channel(256);
     let console = ConsoleState::new(ConsoleConfig {
-        github_api_url: None,
-        github_token: None,
         workspace_dir: Some(workspace_dir),
-        cache_file: None,
         metadata_ttl: Duration::from_secs(3600),
+        ..ConsoleConfig::default()
     });
     console.attach_storage(storage);
 

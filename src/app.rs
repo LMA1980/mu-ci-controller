@@ -24,6 +24,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/webhook", post(handle_webhook))
         .route("/queue", get(get_queue))
         .route("/api/queue", get(get_queue))
+        .route("/api/ci/queue", get(get_queue))
         .route("/events", get(handle_events))
         .route("/api/events", get(handle_events))
         .route("/jobs/{id}/events", get(handle_job_events))
@@ -223,6 +224,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(crate::console::platform_auth::internal_auth_snapshot),
         )
         .route("/api/repos", get(crate::console::api::list_repos))
+        .route(
+            "/api/repos/prune",
+            post(crate::console::api::prune_repos_handler),
+        )
+        .route(
+            "/api/repos/{owner}/{repo}",
+            delete(crate::console::api::retire_repo_handler),
+        )
         .route(
             "/api/repos/{owner}/{repo}/summary",
             get(crate::console::api::repo_summary),
@@ -488,6 +497,22 @@ fn sanitize_queue_snapshot(snap: &mut crate::job::QueueSnapshot) {
     }
 }
 
+async fn build_filtered_queue_snapshot(
+    state: &AppState,
+    is_auth: bool,
+) -> crate::job::QueueSnapshot {
+    let mut snap = state.job_store.queue_snapshot().await;
+    let retired = state.console.retired_repos().await;
+    if !retired.is_empty() {
+        snap.recent_jobs
+            .retain(|rec| !retired.contains_key(&rec.job.repo_name.to_ascii_lowercase()));
+    }
+    if !is_auth {
+        sanitize_queue_snapshot(&mut snap);
+    }
+    snap
+}
+
 pub async fn health_check(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     let is_auth = is_authenticated_request(&state, &headers);
     let controller_id = if is_auth {
@@ -553,10 +578,7 @@ pub async fn get_queue(headers: HeaderMap, State(state): State<Arc<AppState>>) -
         return denied;
     }
     let is_auth = is_authenticated_request(&state, &headers);
-    let mut snap = state.job_store.queue_snapshot().await;
-    if !is_auth {
-        sanitize_queue_snapshot(&mut snap);
-    }
+    let snap = build_filtered_queue_snapshot(&state, is_auth).await;
     json_response(StatusCode::OK, serde_json::to_value(snap).unwrap())
 }
 
@@ -1608,10 +1630,7 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
     let mut console_rx = state.console.subscribe();
     let stream = async_stream::stream! {
         // 1. Initial snapshot push
-        let mut snap = state.job_store.queue_snapshot().await;
-        if !authenticated {
-            sanitize_queue_snapshot(&mut snap);
-        }
+        let snap = build_filtered_queue_snapshot(&state, authenticated).await;
         if let Ok(data) = serde_json::to_string(&snap) {
             yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
         }
@@ -1641,10 +1660,7 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
         loop {
             tokio::select! {
                 _ = state.job_store.wait_for_event() => {
-                    let mut snap = state.job_store.queue_snapshot().await;
-                    if !authenticated {
-                        sanitize_queue_snapshot(&mut snap);
-                    }
+                    let snap = build_filtered_queue_snapshot(&state, authenticated).await;
                     if let Ok(data) = serde_json::to_string(&snap) {
                         yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
                     }
