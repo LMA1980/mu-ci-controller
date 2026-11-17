@@ -21,6 +21,8 @@ pub enum GitHubError {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RepoMetadata {
     #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default)]
     pub private: bool,
     #[serde(default)]
     pub visibility: Option<String>,
@@ -88,15 +90,24 @@ impl GitHubClient {
         }
     }
 
-    /// `GET /repos/{owner}/{repo}`. Private repositories that the token cannot see
-    /// return [`GitHubError::NotFound`].
+    /// `GET /repos/{owner}/{repo}`. Private repositories that the token cannot see,
+    /// as well as renamed repositories whose canonical `full_name` no longer matches
+    /// `{owner}/{repo}` after an HTTP 301 redirect, return [`GitHubError::NotFound`].
     pub async fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoMetadata, GitHubError> {
         let url = format!("{}/repos/{}/{}", self.base_url, owner, repo);
-        self.send(&url, "application/vnd.github+json")
+        let meta = self
+            .send(&url, "application/vnd.github+json")
             .await?
             .json::<RepoMetadata>()
             .await
-            .map_err(|e| GitHubError::Api(e.to_string()))
+            .map_err(|e| GitHubError::Api(e.to_string()))?;
+        if let Some(actual) = meta.full_name.as_deref() {
+            let trimmed = actual.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(&format!("{owner}/{repo}")) {
+                return Err(GitHubError::NotFound);
+            }
+        }
+        Ok(meta)
     }
 
     /// Raw contents of `path` at `git_ref`.
@@ -141,5 +152,25 @@ impl GitHubClient {
         } else {
             Err(GitHubError::NotFound)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_metadata_deserializes_optional_full_name() {
+        let legacy: RepoMetadata =
+            serde_json::from_str(r#"{"private": false, "visibility": "public"}"#).unwrap();
+        assert_eq!(legacy.full_name, None);
+
+        let canonical: RepoMetadata =
+            serde_json::from_str(r#"{"full_name": "LMA1980/mu-ci-controller", "private": false}"#)
+                .unwrap();
+        assert_eq!(
+            canonical.full_name.as_deref(),
+            Some("LMA1980/mu-ci-controller")
+        );
     }
 }
