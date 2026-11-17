@@ -870,25 +870,30 @@ impl MuObserveRemoteStorage {
             let trace_ctx = job_stage_trace_context(job_id, &commit_sha, &entry.stage_id);
             let trace_id = encode_hex(&trace_ctx.trace_id);
             let span_id = encode_hex(&trace_ctx.span_id);
-            let (severity_number, severity_text, stream_name) = if entry.stream == 2 {
-                (13, "WARN".to_string(), "stderr")
+            let (severity_number, severity_text, stream_name, is_test_fixture) =
+                classify_structured_log_entry(&entry.stage_id, entry.stream, &entry.content);
+            let attrs = if is_test_fixture {
+                serde_json::json!({
+                    "stream": stream_name,
+                    "line_no": entry.line_no,
+                    "test_fixture": true,
+                })
             } else {
-                (9, "INFO".to_string(), "stdout")
+                serde_json::json!({
+                    "stream": stream_name,
+                    "line_no": entry.line_no,
+                })
             };
             let mut otel_entry = OtelLogEntry {
                 timestamp_unix_nano: ts_ns,
                 trace_id,
                 span_id,
                 severity_number,
-                severity_text,
-                service_name: "action-runner-worker".to_string(),
+                severity_text: severity_text.to_string(),
+                service_name: "mu-ci-worker".to_string(),
                 node_id: entry.node_id.clone(),
                 body: entry.content.clone(),
-                attributes_json: serde_json::json!({
-                    "stream": stream_name,
-                    "line_no": entry.line_no,
-                })
-                .to_string(),
+                attributes_json: attrs.to_string(),
                 job_id: Some(job_id.to_string()),
                 stage_id: Some(entry.stage_id.clone()),
             };
@@ -941,7 +946,7 @@ impl MuObserveRemoteStorage {
     }
 
     /// Splits controller log `chunk` into individual lines, converts each line into a redacted
-    /// [`OtelLogEntry`] with `service_name = "action-runner-controller"`, updates the bounded
+    /// [`OtelLogEntry`] with `service_name = "mu-ci-controller"`, updates the bounded
     /// local `log_buffer`, and queues the delta entries in `pending_log_lines`.
     pub fn append_log_lines(&self, job_id: &str, chunk: &str) -> usize {
         if chunk.is_empty() {
@@ -975,7 +980,7 @@ impl MuObserveRemoteStorage {
                 span_id: span_id.clone(),
                 severity_number: 9,
                 severity_text: "INFO".to_string(),
-                service_name: "action-runner-controller".to_string(),
+                service_name: "mu-ci-controller".to_string(),
                 node_id: "controller".to_string(),
                 body: trimmed.to_string(),
                 attributes_json: serde_json::json!({
@@ -2583,6 +2588,178 @@ pub fn apply_regression_gate_to_job(
     }
 }
 
+/// Semantic outcome classification for CI stage and pipeline failures across W3C trace spans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiFailureKind {
+    UserCode,
+    UserTimeout,
+    Cancelled,
+    Superseded,
+    RegressionGate,
+    ToolchainConstraint,
+    InfraError,
+}
+
+impl CiFailureKind {
+    /// Returns `"OK"` for expected user CI outcomes/cancellations and `"ERROR"` strictly for
+    /// controller or worker infrastructure faults.
+    #[must_use]
+    pub const fn span_status_code(self) -> &'static str {
+        match self {
+            Self::InfraError => "ERROR",
+            Self::UserCode
+            | Self::UserTimeout
+            | Self::Cancelled
+            | Self::Superseded
+            | Self::RegressionGate
+            | Self::ToolchainConstraint => "OK",
+        }
+    }
+
+    #[must_use]
+    pub const fn outcome_label(self) -> &'static str {
+        match self {
+            Self::UserCode | Self::ToolchainConstraint => "user_failure",
+            Self::UserTimeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+            Self::RegressionGate => "regression_detected",
+            Self::InfraError => "infra_failure",
+        }
+    }
+
+    #[must_use]
+    pub const fn failure_class_label(self) -> &'static str {
+        match self {
+            Self::UserCode => "user_code",
+            Self::UserTimeout => "user_timeout",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+            Self::RegressionGate => "regression_gate",
+            Self::ToolchainConstraint => "toolchain_constraint",
+            Self::InfraError => "infra_error",
+        }
+    }
+}
+
+/// Extracts an explicit numeric exit code embedded in standard worker/controller error strings.
+#[must_use]
+pub(crate) fn extract_exit_code_from_error(error: &str) -> Option<i32> {
+    let lower = error.to_ascii_lowercase();
+    for prefix in [
+        "status code some(",
+        "failed with code ",
+        "exited with code ",
+    ] {
+        if let Some(idx) = lower.find(prefix) {
+            let tail = &lower[idx + prefix.len()..];
+            let digits: String = tail
+                .chars()
+                .take_while(|c| *c == '-' || c.is_ascii_digit())
+                .collect();
+            if let Ok(code) = digits.parse::<i32>() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// Classifies an explicit failure marker or embedded exit code when present in an error string.
+#[must_use]
+pub(crate) fn match_explicit_ci_failure_kind(error: &str) -> Option<CiFailureKind> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("superseded") {
+        return Some(CiFailureKind::Superseded);
+    }
+    if lower.contains("cancelled") || lower.contains("canceled") {
+        return Some(CiFailureKind::Cancelled);
+    }
+    if lower.contains("regressiondetected:") {
+        return Some(CiFailureKind::RegressionGate);
+    }
+    if lower.contains("workflow toolchain.min_version") {
+        return Some(CiFailureKind::ToolchainConstraint);
+    }
+    if lower.contains("security grant denied")
+        || lower.contains("securitygrantdenied")
+        || lower.contains("failed to spawn")
+        || lower.contains("i/o wait error")
+        || lower.contains("failed to prepare")
+        || lower.contains("prohibited shell")
+        || lower.contains("invalid working_dir")
+        || lower.contains("failed to resolve")
+        || lower.contains("failed to serialize")
+        || lower.contains("failed to build stage dispatch")
+        || lower.contains("missing from resolved workflow configuration")
+        || lower.contains("failed to load workflow")
+        || lower.contains("sccache")
+        || lower.contains("status code none")
+    {
+        return Some(CiFailureKind::InfraError);
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return Some(CiFailureKind::UserTimeout);
+    }
+    if let Some(code) = extract_exit_code_from_error(error) {
+        return Some(match code {
+            130 => CiFailureKind::Cancelled,
+            124 => CiFailureKind::UserTimeout,
+            126 | 127 => CiFailureKind::InfraError,
+            c if c < 0 => CiFailureKind::InfraError,
+            _ => CiFailureKind::UserCode,
+        });
+    }
+    None
+}
+
+/// Classifies a non-zero stage or pipeline error message into user CI outcome vs. infrastructure
+/// fault for OpenTelemetry span status emission (`#218`, `#219`).
+#[must_use]
+pub(crate) fn classify_ci_error_message(error: &str) -> CiFailureKind {
+    match_explicit_ci_failure_kind(error).unwrap_or(CiFailureKind::InfraError)
+}
+
+fn is_test_or_coverage_stage(stage_id: &str) -> bool {
+    let lower = stage_id.to_ascii_lowercase();
+    lower.contains("test") || lower.contains("cov") || lower.contains("miri")
+}
+
+fn has_bracketed_fixture_error_tag(lower_line: &str) -> bool {
+    let mut rest = lower_line;
+    while let Some(open) = rest.find('[') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find(']') else {
+            break;
+        };
+        let inside = after_open[..close].trim();
+        if inside == "error" || inside.ends_with(" error") {
+            return true;
+        }
+        rest = &after_open[close + 1..];
+    }
+    false
+}
+
+/// Returns `(severity_number, severity_text, stream_name, is_test_fixture)` for child stage
+/// tool output. Routine `stderr` lines (`cargo`, `git`, `rustc`) and negative-test fixture
+/// lines remain `INFO` while retaining `stream = "stderr"` provenance (`#225`).
+#[must_use]
+pub(crate) fn classify_structured_log_entry(
+    stage_id: &str,
+    stream: i8,
+    content: &str,
+) -> (i32, &'static str, &'static str, bool) {
+    let stream_name = if stream == 2 { "stderr" } else { "stdout" };
+    let lower = content.to_ascii_lowercase();
+    let is_known_fixture = lower.contains("[k3-worker error]")
+        || lower.contains("[mu-ci-worker error]")
+        || lower.contains("[action-runner-worker error]");
+    let is_test_fixture = is_known_fixture
+        || (is_test_or_coverage_stage(stage_id) && has_bracketed_fixture_error_tag(&lower));
+    (9, "INFO", stream_name, is_test_fixture)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2712,7 +2889,7 @@ mod tests {
         let batches = received_otel_batches.lock().expect("lock");
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[0][0].service_name, "action-runner-worker");
+        assert_eq!(batches[0][0].service_name, "mu-ci-worker");
         assert_eq!(batches[0][0].node_id, "node-a");
         assert_eq!(batches[0][0].body, "Compiling crate v0.1.0");
         assert_eq!(
@@ -2726,6 +2903,8 @@ mod tests {
                 .contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"),
             "secret token must be redacted before leaving controller"
         );
+        assert_eq!(batches[0][1].severity_number, 9);
+        assert_eq!(batches[0][1].severity_text, "INFO");
         assert_eq!(
             batches[0][1].attributes_json,
             r#"{"line_no":2,"stream":"stderr"}"#
@@ -2733,7 +2912,7 @@ mod tests {
 
         assert_eq!(batches[1].len(), 2);
         assert_eq!(batches[1][0].body, "Finished release target");
-        assert_eq!(batches[1][1].service_name, "action-runner-controller");
+        assert_eq!(batches[1][1].service_name, "mu-ci-controller");
         assert_eq!(batches[1][1].body, "Stage build succeeded");
 
         // All worker stages and controller logs for job-delta-1 must share the exact same W3C trace_id (#142)
@@ -2887,5 +3066,68 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].span_name, "ci.pipeline.run:test-repo");
         assert_eq!(emitted[0].trace_id, span.trace_id);
+    }
+
+    #[test]
+    fn test_stage_stderr_and_negative_fixtures_remain_info_with_canonical_service_names() {
+        let storage = MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(
+            "127.0.0.1:9".to_string(),
+        ))
+        .expect("storage init");
+        storage.register_job_commit_sha("job-log-sev-1", "deadbeefcafe1234");
+
+        let entries = vec![
+            mu_ci_ipc::LogEntry {
+                job_id: "job-log-sev-1".to_string(),
+                stage_id: "build-check".to_string(),
+                node_id: "node-a".to_string(),
+                timestamp_us: 1_000,
+                stream: 2,
+                line_no: 1,
+                content: "   Compiling mu-ci-controller v0.1.1".to_string(),
+            },
+            mu_ci_ipc::LogEntry {
+                job_id: "job-log-sev-1".to_string(),
+                stage_id: "coverage-check".to_string(),
+                node_id: "node-a".to_string(),
+                timestamp_us: 2_000,
+                stream: 2,
+                line_no: 2,
+                content: "[k3-worker error] simulated negative test fixture failure".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            storage.append_structured_log_entries_sync("job-log-sev-1", &entries),
+            2
+        );
+        assert_eq!(
+            storage.append_log_lines("job-log-sev-1", "Dispatching stage\n"),
+            1
+        );
+
+        let snap = storage.pending_log_lines_snapshot();
+        assert_eq!(snap.len(), 3);
+
+        // Routine cargo stderr -> INFO, stream="stderr", service_name="mu-ci-worker"
+        assert_eq!(snap[0].severity_number, 9);
+        assert_eq!(snap[0].severity_text, "INFO");
+        assert_eq!(snap[0].service_name, "mu-ci-worker");
+        let a0: serde_json::Value = serde_json::from_str(&snap[0].attributes_json).unwrap();
+        assert_eq!(a0["stream"], "stderr");
+        assert!(a0.get("test_fixture").is_none());
+
+        // Negative-test fixture line -> INFO, stream="stderr", test_fixture=true
+        assert_eq!(snap[1].severity_number, 9);
+        assert_eq!(snap[1].severity_text, "INFO");
+        assert_eq!(snap[1].service_name, "mu-ci-worker");
+        let a1: serde_json::Value = serde_json::from_str(&snap[1].attributes_json).unwrap();
+        assert_eq!(a1["stream"], "stderr");
+        assert_eq!(a1["test_fixture"], true);
+
+        // Controller log -> INFO, service_name="mu-ci-controller"
+        assert_eq!(snap[2].severity_number, 9);
+        assert_eq!(snap[2].severity_text, "INFO");
+        assert_eq!(snap[2].service_name, "mu-ci-controller");
     }
 }

@@ -161,6 +161,8 @@ pub struct AuthSessionDto {
     pub bound_roles: Vec<String>,
     #[serde(default)]
     pub bound_role_specs: Vec<RoleSpec>,
+    #[serde(default)]
+    pub catalog_role_specs: Vec<RoleSpec>,
     pub active_roles: Vec<RoleSpec>,
     pub leases: Vec<RoleLeaseViewDto>,
     pub active_folios: Vec<String>,
@@ -277,6 +279,8 @@ pub struct PlatformAuthState {
     pub bootstrap_seeded: BTreeSet<String>,
     #[serde(default)]
     pub super_operator_seeded: bool,
+    #[serde(default)]
+    pub bootstrap_ci_operator_seeded: bool,
     pub audit_activity: Vec<AuditActivityEntryDto>,
     pub snapshot_revision: u64,
     #[serde(skip)]
@@ -406,6 +410,7 @@ impl PlatformAuthState {
             role_leases: BTreeMap::new(),
             bootstrap_seeded: BTreeSet::new(),
             super_operator_seeded: true,
+            bootstrap_ci_operator_seeded: true,
             audit_activity: Vec::new(),
             snapshot_revision: 1,
             pending_registrations: HashMap::new(),
@@ -417,16 +422,20 @@ impl PlatformAuthState {
     /// Re-registers immutable canonical subsystem manifests on deserialized state
     /// without overwriting custom operator folios, roles, or `RoleFolioIndex` mappings.
     pub fn reconcile_after_load(&mut self) {
+        let _ = self.reconcile_after_load_changed();
+    }
+
+    pub(crate) fn reconcile_after_load_changed(&mut self) -> bool {
         if !self.initialized {
             *self = Self::seeded_default();
-            return;
+            return true;
         }
         for m in mu_auth::canonical_manifests() {
             let _ = self.folio_catalog.register_manifest(m);
         }
+        let mut changed = false;
         if !self.super_operator_seeded {
             let super_rid = rid(SUPER_OPERATOR_ROLE_ID);
-            let mut changed = false;
             if self.role_catalog.get(&super_rid).is_none()
                 && self
                     .role_catalog
@@ -471,10 +480,59 @@ impl PlatformAuthState {
                 }
             }
             self.super_operator_seeded = true;
-            if changed {
-                self.snapshot_revision = self.snapshot_revision.saturating_add(1);
+        }
+        if !self.bootstrap_ci_operator_seeded {
+            let baseline = self.baseline_role_id().clone();
+            if self.backfill_existing_bootstrap_admins(&baseline) {
+                changed = true;
+            }
+            self.bootstrap_ci_operator_seeded = true;
+        }
+        if changed {
+            self.snapshot_revision = self.snapshot_revision.saturating_add(1);
+        }
+        changed
+    }
+
+    fn bind_default_bootstrap_roles(&mut self, key: &str, baseline: &RoleId) -> bool {
+        let mut changed = false;
+        let roles = self.user_roles.entry(key.to_string()).or_default();
+        if roles.insert(baseline.clone()) {
+            changed = true;
+        }
+        for role_str in [
+            ELECTIVE_CI_ROLE_ID,
+            ADMIN_TIMED_ROLE_ID,
+            SUPER_OPERATOR_ROLE_ID,
+        ] {
+            if let Some(spec) = self.role_catalog.get(&rid(role_str)) {
+                if roles.insert(spec.id.clone()) {
+                    changed = true;
+                }
             }
         }
+        changed
+    }
+
+    fn backfill_existing_bootstrap_admins(&mut self, baseline: &RoleId) -> bool {
+        let keys: Vec<String> = self
+            .bootstrap_seeded
+            .iter()
+            .filter(|key| {
+                self.users
+                    .get(key.as_str())
+                    .is_some_and(|user| !user.revoked)
+            })
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for key in keys {
+            if self.bind_default_bootstrap_roles(&key, baseline) {
+                changed = true;
+            }
+            self.user_prefs.entry(key).or_default();
+        }
+        changed
     }
 
     #[must_use]
@@ -502,7 +560,8 @@ impl PlatformAuthState {
         self.users.get(&key).filter(|u| !u.revoked)
     }
 
-    /// Seeds bootstrap admins once per login lifecycle without reviving explicitly revoked admins.
+    /// Seeds bootstrap admins and idempotently back-fills missing default role bindings
+    /// for existing non-revoked bootstrap-seeded administrators without reviving revoked admins.
     pub fn seed_bootstrap_admins(&mut self, admins: &[String], now: DateTime<Utc>) -> bool {
         let baseline = self.baseline_role_id().clone();
         let now_str = now.to_rfc3339();
@@ -515,14 +574,12 @@ impl PlatformAuthState {
                 continue;
             }
             let key = clean.to_ascii_lowercase();
-            if !self.bootstrap_seeded.insert(key.clone()) {
-                continue;
-            }
+            let newly_seeded = self.bootstrap_seeded.insert(key.clone());
             if let Some(existing) = self.users.get(&key) {
                 if existing.revoked {
                     continue;
                 }
-            } else {
+            } else if newly_seeded {
                 self.users.insert(
                     key.clone(),
                     PlatformUserRecord {
@@ -539,24 +596,19 @@ impl PlatformAuthState {
                     },
                 );
                 changed = true;
+            } else {
+                continue;
             }
 
-            let roles = self.user_roles.entry(key.clone()).or_default();
-            if roles.insert(baseline.clone()) {
+            if self.bind_default_bootstrap_roles(&key, &baseline) {
                 changed = true;
-            }
-            if let Some(admin_role) = self.role_catalog.get(&rid(ADMIN_TIMED_ROLE_ID)) {
-                if roles.insert(admin_role.id.clone()) {
-                    changed = true;
-                }
-            }
-            if let Some(super_role) = self.role_catalog.get(&rid(SUPER_OPERATOR_ROLE_ID)) {
-                if roles.insert(super_role.id.clone()) {
-                    changed = true;
-                }
             }
             self.user_prefs.entry(key).or_default();
         }
+        if self.backfill_existing_bootstrap_admins(&baseline) {
+            changed = true;
+        }
+        self.bootstrap_ci_operator_seeded = true;
         if changed {
             self.snapshot_revision = self.snapshot_revision.saturating_add(1);
         }
@@ -891,6 +943,7 @@ impl PlatformAuthState {
                 baseline_role: Some(baseline_id),
                 bound_roles: Vec::new(),
                 bound_role_specs: Vec::new(),
+                catalog_role_specs: Vec::new(),
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -914,6 +967,7 @@ impl PlatformAuthState {
                 baseline_role: Some(baseline_id),
                 bound_roles: Vec::new(),
                 bound_role_specs: Vec::new(),
+                catalog_role_specs: Vec::new(),
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -949,7 +1003,8 @@ impl PlatformAuthState {
                 anonymous_login_only: anon_lockdown,
                 baseline_role: Some(baseline_id),
                 bound_roles,
-                bound_role_specs,
+                bound_role_specs: Vec::new(),
+                catalog_role_specs: Vec::new(),
                 active_roles: Vec::new(),
                 leases: Vec::new(),
                 active_folios: Vec::new(),
@@ -959,6 +1014,7 @@ impl PlatformAuthState {
             };
         }
 
+        let catalog_role_specs: Vec<RoleSpec> = self.role_catalog.iter().cloned().collect();
         let active_roles: Vec<RoleSpec> = eval
             .active_roles
             .iter()
@@ -985,6 +1041,7 @@ impl PlatformAuthState {
             baseline_role: Some(baseline_id),
             bound_roles,
             bound_role_specs,
+            catalog_role_specs,
             active_roles,
             leases: self.build_lease_views(leases, now_ms),
             active_folios: eval.active_folios.iter().map(ToString::to_string).collect(),
@@ -1305,6 +1362,12 @@ pub fn save_auth_state_atomic(path: &Path, state: &PlatformAuthState) -> Result<
 
 /// Loads [`PlatformAuthState`] JSON from disk if present.
 pub fn load_auth_state_file(path: &Path) -> Result<Option<PlatformAuthState>, String> {
+    load_auth_state_file_with_reconciled(path).map(|opt| opt.map(|(state, _)| state))
+}
+
+pub(crate) fn load_auth_state_file_with_reconciled(
+    path: &Path,
+) -> Result<Option<(PlatformAuthState, bool)>, String> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -1312,8 +1375,8 @@ pub fn load_auth_state_file(path: &Path) -> Result<Option<PlatformAuthState>, St
         .map_err(|e| format!("Failed to read auth state file {}: {e}", path.display()))?;
     let mut parsed: PlatformAuthState = serde_json::from_str(&raw)
         .map_err(|e| format!("Failed to parse auth state file {}: {e}", path.display()))?;
-    parsed.reconcile_after_load();
-    Ok(Some(parsed))
+    let changed = parsed.reconcile_after_load_changed();
+    Ok(Some((parsed, changed)))
 }
 
 #[must_use]
@@ -1790,6 +1853,8 @@ mod tests {
             .get("lma1980")
             .unwrap()
             .contains(&rid(SUPER_OPERATOR_ROLE_ID)));
+        st.passkeys
+            .insert("lma1980".to_string(), vec![dummy_stored_passkey("cred-1")]);
 
         // Simulate legacy snapshot loaded before `super-operator` existed.
         st.super_operator_seeded = false;
@@ -1869,5 +1934,212 @@ mod tests {
             .bound_role_specs
             .iter()
             .any(|s| s.id.as_str() == SUPER_OPERATOR_ROLE_ID));
+        assert!(dto
+            .catalog_role_specs
+            .iter()
+            .any(|s| s.id.as_str() == ELECTIVE_CI_ROLE_ID));
+    }
+
+    #[test]
+    fn seed_bootstrap_admins_backfills_all_four_roles_and_respects_revoked() {
+        let mut st = PlatformAuthState::seeded_default();
+        let now = Utc::now();
+
+        // Simulate legacy snapshot where LMA1980 and a revoked admin were already in bootstrap_seeded
+        // with only `operator` and `platform-admin`, missing `ci-operator` and `super-operator`.
+        st.bootstrap_seeded.insert("lma1980".to_string());
+        st.bootstrap_seeded.insert("revoked-admin".to_string());
+        st.bootstrap_ci_operator_seeded = false;
+        st.users.insert(
+            "lma1980".to_string(),
+            PlatformUserRecord {
+                github_login: "LMA1980".to_string(),
+                display_name: None,
+                invited_by: "bootstrap".to_string(),
+                invite_id: None,
+                bound_at: now.to_rfc3339(),
+                bound_at_ms: 1_000,
+                last_seen_ms: None,
+                revoked: false,
+                revoked_at: None,
+                elevation_epoch: 1,
+            },
+        );
+        st.user_roles.insert(
+            "lma1980".to_string(),
+            BTreeSet::from([rid(BASELINE_ROLE_ID), rid(ADMIN_TIMED_ROLE_ID)]),
+        );
+        st.users.insert(
+            "revoked-admin".to_string(),
+            PlatformUserRecord {
+                github_login: "revoked-admin".to_string(),
+                display_name: None,
+                invited_by: "bootstrap".to_string(),
+                invite_id: None,
+                bound_at: now.to_rfc3339(),
+                bound_at_ms: 1_000,
+                last_seen_ms: None,
+                revoked: true,
+                revoked_at: Some(now.to_rfc3339()),
+                elevation_epoch: 2,
+            },
+        );
+
+        assert!(st.seed_bootstrap_admins(&["LMA1980".to_string()], now));
+        assert!(!st.seed_bootstrap_admins(&["LMA1980".to_string()], now));
+        let bound = st.user_roles.get("lma1980").unwrap();
+        for expected in [
+            BASELINE_ROLE_ID,
+            ELECTIVE_CI_ROLE_ID,
+            ADMIN_TIMED_ROLE_ID,
+            SUPER_OPERATOR_ROLE_ID,
+        ] {
+            assert!(
+                bound.contains(&rid(expected)),
+                "missing bootstrap role {expected}"
+            );
+        }
+        assert!(st.users.get("revoked-admin").unwrap().revoked);
+        assert!(!st.user_roles.contains_key("revoked-admin"));
+
+        // Verify reconcile_after_load also backfills legacy JSON snapshots on hydration.
+        let mut legacy = PlatformAuthState::seeded_default();
+        legacy.bootstrap_seeded.insert("legacyadmin".to_string());
+        legacy.bootstrap_ci_operator_seeded = false;
+        legacy.users.insert(
+            "legacyadmin".to_string(),
+            PlatformUserRecord {
+                github_login: "LegacyAdmin".to_string(),
+                display_name: None,
+                invited_by: "bootstrap".to_string(),
+                invite_id: None,
+                bound_at: now.to_rfc3339(),
+                bound_at_ms: 1_000,
+                last_seen_ms: None,
+                revoked: false,
+                revoked_at: None,
+                elevation_epoch: 1,
+            },
+        );
+        legacy.user_roles.insert(
+            "legacyadmin".to_string(),
+            BTreeSet::from([rid(BASELINE_ROLE_ID)]),
+        );
+        assert!(legacy.reconcile_after_load_changed());
+        assert!(legacy.bootstrap_ci_operator_seeded);
+        let legacy_roles = legacy.user_roles.get("legacyadmin").unwrap();
+        assert!(legacy_roles.contains(&rid(ELECTIVE_CI_ROLE_ID)));
+        assert!(legacy_roles.contains(&rid(ADMIN_TIMED_ROLE_ID)));
+        assert!(legacy_roles.contains(&rid(SUPER_OPERATOR_ROLE_ID)));
+    }
+
+    #[test]
+    fn build_session_dto_catalog_role_specs_scopes_and_fail_closed_gates() {
+        let mut st = PlatformAuthState::seeded_default();
+        let now = Utc::now();
+        st.bind_baseline_user("alice", "LMA1980", Some("inv-1"), now);
+
+        // Anonymous -> empty bound_role_specs and catalog_role_specs.
+        let (_, leases_anon, eval_anon) = st.evaluate_principal(None, false, 10_000);
+        let dto_anon = st.build_session_dto(None, &leases_anon, &eval_anon, 10_000);
+        assert!(!dto_anon.authenticated);
+        assert!(dto_anon.bound_role_specs.is_empty());
+        assert!(dto_anon.catalog_role_specs.is_empty());
+
+        // Uninvited -> empty bound_role_specs and catalog_role_specs.
+        let (_, leases_uninv, eval_uninv) = st.evaluate_principal(Some("stranger"), false, 10_000);
+        let dto_uninv = st.build_session_dto(Some("stranger"), &leases_uninv, &eval_uninv, 10_000);
+        assert!(!dto_uninv.authenticated);
+        assert!(dto_uninv.bound_role_specs.is_empty());
+        assert!(dto_uninv.catalog_role_specs.is_empty());
+
+        // 0-Passkey -> fail closed with empty bound_role_specs and catalog_role_specs.
+        let (_, leases_zero, eval_zero) = st.evaluate_principal(Some("alice"), false, 10_000);
+        let dto_zero = st.build_session_dto(Some("alice"), &leases_zero, &eval_zero, 10_000);
+        assert!(dto_zero.passkey_enrollment_required);
+        assert!(dto_zero.bound_role_specs.is_empty());
+        assert!(dto_zero.catalog_role_specs.is_empty());
+
+        // After Passkey enrollment -> caller gets bound_role_specs (only operator) AND deterministic
+        // catalog_role_specs containing all catalog roles.
+        st.passkeys.insert(
+            "alice".to_string(),
+            vec![dummy_stored_passkey("cred-alice")],
+        );
+        let (_, leases_auth, eval_auth) = st.evaluate_principal(Some("alice"), false, 10_000);
+        let dto_auth = st.build_session_dto(Some("alice"), &leases_auth, &eval_auth, 10_000);
+        assert!(dto_auth.authenticated);
+        assert!(!dto_auth.passkey_enrollment_required);
+        let bound_ids: Vec<&str> = dto_auth
+            .bound_role_specs
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(bound_ids, vec![BASELINE_ROLE_ID]);
+        let catalog_ids: Vec<&str> = dto_auth
+            .catalog_role_specs
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            catalog_ids,
+            vec![
+                ELECTIVE_CI_ROLE_ID,
+                BASELINE_ROLE_ID,
+                ADMIN_TIMED_ROLE_ID,
+                SUPER_OPERATOR_ROLE_ID,
+            ]
+        );
+
+        // Backward-compatible JSON deserialization when catalog_role_specs is omitted.
+        let mut legacy_json = serde_json::to_value(&dto_auth).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("catalog_role_specs");
+        let parsed: AuthSessionDto = serde_json::from_value(legacy_json).unwrap();
+        assert!(parsed.catalog_role_specs.is_empty());
+    }
+
+    fn dummy_stored_passkey(id: &str) -> StoredPasskeyRecord {
+        use webauthn_rs_core::proto::{
+            AttestationFormat, COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, Credential,
+            ECDSACurve, ParsedAttestation, RegisteredExtensions, UserVerificationPolicy,
+        };
+        let extensions: RegisteredExtensions = serde_json::from_str("{}").unwrap();
+        let cred = Credential {
+            cred_id: id.as_bytes().to_vec(),
+            cred: COSEKey {
+                type_: COSEAlgorithm::ES256,
+                key: COSEKeyType::EC_EC2(COSEEC2Key {
+                    curve: ECDSACurve::SECP256R1,
+                    x: vec![1; 32],
+                    y: vec![2; 32],
+                }),
+            },
+            counter: 0,
+            transports: None,
+            user_verified: true,
+            backup_eligible: true,
+            backup_state: true,
+            registration_policy: UserVerificationPolicy::Preferred,
+            extensions,
+            attestation: ParsedAttestation::default(),
+            attestation_format: AttestationFormat::None,
+        };
+        StoredPasskeyRecord {
+            credential_id: id.to_string(),
+            record: PasskeyRecord {
+                credential_id: id.as_bytes().to_vec(),
+                label: Some("Test".to_string()),
+                credential: cred,
+                sign_count: 0,
+                created_at_ms: 1_000,
+                last_used_at_ms: None,
+            },
+            label: Some("Test".to_string()),
+            created_at_ms: 1_000,
+            last_used_at_ms: None,
+        }
     }
 }

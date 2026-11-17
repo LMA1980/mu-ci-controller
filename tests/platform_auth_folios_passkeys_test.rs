@@ -1378,3 +1378,220 @@ async fn super_operator_role_elevation_and_single_last_2m_passkey_renewal() {
     .await;
     assert_eq!(st_second, StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn session_exposes_catalog_role_specs_and_backfills_legacy_bootstrap_admins() {
+    let tmp = tempfile::tempdir().expect("create temp workspace");
+    let auth_file = tmp.path().join("logs").join("platform_auth.json");
+    std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+
+    // Seed an existing platform_auth.json snapshot where LMA1980 is already in `bootstrap_seeded`
+    // with only `operator` and `platform-admin`, missing `ci-operator` and `super-operator`,
+    // and where `revoked-admin` is explicitly revoked.
+    let mut legacy = mu_ci_controller::auth::PlatformAuthState::seeded_default();
+    let now = chrono::Utc::now();
+    legacy.bootstrap_seeded.insert("lma1980".to_string());
+    legacy.bootstrap_seeded.insert("revoked-admin".to_string());
+    legacy.bootstrap_ci_operator_seeded = false;
+    legacy.users.insert(
+        "lma1980".to_string(),
+        mu_ci_controller::auth::PlatformUserRecord {
+            github_login: "LMA1980".to_string(),
+            display_name: None,
+            invited_by: "bootstrap".to_string(),
+            invite_id: None,
+            bound_at: now.to_rfc3339(),
+            bound_at_ms: 1_000,
+            last_seen_ms: None,
+            revoked: false,
+            revoked_at: None,
+            elevation_epoch: 1,
+        },
+    );
+    legacy.user_roles.insert(
+        "lma1980".to_string(),
+        std::collections::BTreeSet::from([
+            mu_ci_controller::auth::rid("operator"),
+            mu_ci_controller::auth::rid("platform-admin"),
+        ]),
+    );
+    legacy.users.insert(
+        "revoked-admin".to_string(),
+        mu_ci_controller::auth::PlatformUserRecord {
+            github_login: "revoked-admin".to_string(),
+            display_name: None,
+            invited_by: "bootstrap".to_string(),
+            invite_id: None,
+            bound_at: now.to_rfc3339(),
+            bound_at_ms: 1_000,
+            last_seen_ms: None,
+            revoked: true,
+            revoked_at: Some(now.to_rfc3339()),
+            elevation_epoch: 1,
+        },
+    );
+    mu_ci_controller::auth::save_auth_state_atomic(&auth_file, &legacy).unwrap();
+
+    let mut cfg = Config {
+        bind_addr: "127.0.0.1:0".to_string(),
+        workspace_dir: tmp.path().to_path_buf(),
+        allowed_repositories: vec!["LMA1980/*".to_string()],
+        allowed_actors: vec!["*".to_string()],
+        allow_fork_prs: false,
+        allowed_pr_authors: vec!["OWNER".to_string()],
+        log_api_key: Some(API_KEY.to_string()),
+        webhook_secret: None,
+        cluster_token: CLUSTER_TOKEN.to_string(),
+        job_timeout_seconds: 30,
+        allow_insecure_no_secret: true,
+        max_concurrent_jobs: 2,
+        github_token: None,
+        proxy_secret: Some(PROXY_SECRET.to_string()),
+        invite_signing_key: Some(INVITE_KEY.to_string()),
+        bootstrap_admins: vec!["LMA1980".to_string()],
+        webauthn_rp_id: "console.example.org".to_string(),
+        webauthn_rp_name: "MuConsole Platform".to_string(),
+        webauthn_rp_origin: "https://console.example.org".to_string(),
+        auth_state_file: Some(auth_file),
+        ..Config::default()
+    };
+    cfg.bootstrap_admins.push("revoked-admin".to_string());
+
+    let job_store = JobStore::from_config(100, &cfg);
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console: ConsoleState::new(ConsoleConfig::default()),
+    });
+    let app = create_router(state.clone());
+
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+
+    // 1. Anonymous, uninvited, revoked, and 0-Passkey sessions emit empty bound_role_specs and catalog_role_specs.
+    for hdrs in [
+        &[][..],
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "uninvited-bob"),
+        ][..],
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "revoked-admin"),
+        ][..],
+        &admin_hdrs[..],
+    ] {
+        let (st_s, s_j, _, _) = req_full(&app, "GET", "/api/auth/session", hdrs, None).await;
+        assert_eq!(st_s, StatusCode::OK);
+        assert_eq!(s_j["bound_role_specs"].as_array().unwrap().len(), 0);
+        assert_eq!(s_j["catalog_role_specs"].as_array().unwrap().len(), 0);
+    }
+
+    // 2. Enroll Passkey for back-filled bootstrap admin -> all 4 roles bound + catalog_role_specs populated.
+    let admin_auth = VirtualAuthenticator::new_synced(1, b"cred-backfill-admin");
+    enroll_passkey(&app, &admin_hdrs, &admin_auth, "Admin Passkey", None).await;
+
+    let (st_adm, adm_j, _, _) = req_full(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st_adm, StatusCode::OK);
+    let bound_ids: Vec<&str> = adm_j["bound_role_specs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        bound_ids,
+        vec![
+            "ci-operator",
+            "operator",
+            "platform-admin",
+            "super-operator"
+        ]
+    );
+    let cat_ids: Vec<&str> = adm_j["catalog_role_specs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        cat_ids,
+        vec![
+            "ci-operator",
+            "operator",
+            "platform-admin",
+            "super-operator"
+        ]
+    );
+
+    // 3. Invite baseline-only operator Alice; even though GET /api/auth/roles is 403 Forbidden,
+    //    GET /api/auth/session returns caller-bound `operator` plus full `catalog_role_specs`.
+    let (_, _, cookie_opt) =
+        elevate_role(&app, &admin_hdrs, &admin_auth, 0, "platform-admin").await;
+    let admin_cookie = cookie_opt.unwrap();
+    let elevated_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", admin_cookie.as_str()),
+    ];
+    let (st_inv, inv_j, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &elevated_hdrs,
+        Some(json!({ "note": "baseline alice" })),
+    )
+    .await;
+    assert_eq!(st_inv, StatusCode::CREATED);
+    let alice_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "Alice"),
+    ];
+    let (st_red, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &alice_hdrs,
+        Some(json!({ "invite_token": inv_j["invite_token"] })),
+    )
+    .await;
+    assert_eq!(st_red, StatusCode::OK);
+    let alice_auth = VirtualAuthenticator::new_synced(2, b"cred-alice-cat");
+    enroll_passkey(&app, &alice_hdrs, &alice_auth, "Alice Passkey", None).await;
+
+    let (st_roles, _, _, _) = req_full(&app, "GET", "/api/auth/roles", &alice_hdrs, None).await;
+    assert_eq!(st_roles, StatusCode::FORBIDDEN);
+
+    let (st_alice_sess, alice_sess, _, _) =
+        req_full(&app, "GET", "/api/auth/session", &alice_hdrs, None).await;
+    assert_eq!(st_alice_sess, StatusCode::OK);
+    let alice_bound: Vec<&str> = alice_sess["bound_role_specs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(alice_bound, vec!["operator"]);
+    let alice_cat: Vec<&str> = alice_sess["catalog_role_specs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        alice_cat,
+        vec![
+            "ci-operator",
+            "operator",
+            "platform-admin",
+            "super-operator"
+        ]
+    );
+}

@@ -1423,6 +1423,12 @@ impl JobStore {
 
     pub async fn update_stage_status(&self, job_id: &str, stage_id: &str, status: StageStatus) {
         self.mutate_stage(job_id, stage_id, |stage, record_status| {
+            // Preserve terminal Skipped stage status and any stage on a Skipped (superseded/cancelled) job (#221)
+            if matches!(stage.status, StageStatus::Skipped { .. })
+                || matches!(*record_status, JobStatus::Skipped { .. })
+            {
+                return false;
+            }
             if let StageStatus::Assigned { ref node_id, .. }
             | StageStatus::Running { ref node_id, .. } = status
             {
@@ -1438,6 +1444,7 @@ impl JobStore {
                     started_at: Utc::now(),
                 };
             }
+            true
         })
         .await;
     }
@@ -1451,35 +1458,46 @@ impl JobStore {
         reason_code: String,
         capability: String,
     ) {
-        self.mutate_stage(job_id, stage_id, |stage, _| {
+        self.mutate_stage(job_id, stage_id, |stage, record_status| {
+            if matches!(stage.status, StageStatus::Skipped { .. })
+                || matches!(*record_status, JobStatus::Skipped { .. })
+            {
+                return false;
+            }
             stage.status = StageStatus::Skipped { reason };
             stage.skip_reason_code = Some(reason_code);
             stage.skip_capability = Some(capability);
+            true
         })
         .await;
     }
 
     async fn mutate_stage<F>(&self, job_id: &str, stage_id: &str, f: F)
     where
-        F: FnOnce(&mut StageRecord, &mut JobStatus),
+        F: FnOnce(&mut StageRecord, &mut JobStatus) -> bool,
     {
         let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
-                    f(stage, &mut record.status);
-                    record.updated_at = Utc::now();
+                    if f(stage, &mut record.status) {
+                        record.updated_at = Utc::now();
+                        Some(record.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
-                Some(record.clone())
             } else {
                 None
             }
         };
         if let Some(record) = updated {
             self.run_storage_op(|db| db.upsert_record(&record));
+            self.persist().await;
+            self.notify.notify_waiters();
         }
-        self.persist().await;
-        self.notify.notify_waiters();
     }
 
     pub async fn get_stages(&self, job_id: &str) -> Vec<StageRecord> {
@@ -4425,5 +4443,156 @@ mod tests {
             !should_preserve_local_record(false, &local_running_stage, &remote_completed),
             "Standby controller must never preserve stale local Running record over terminal remote Completed record"
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn update_stage_status_preserves_terminal_skipped_stages_on_superseded_jobs() {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+        let sha = "11223344556677889900aabbccddeeff00112233";
+
+        let push_job = Job {
+            id: "job-push-superseded".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/test".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: None,
+        };
+        store
+            .enqueue_job(push_job.clone(), PathBuf::from("logs/push.log"))
+            .await;
+        store
+            .set_stages(
+                &push_job.id,
+                vec![StageRecord {
+                    id: "clippy-check".to_string(),
+                    name: "Clippy".to_string(),
+                    tags: vec!["x86_64".to_string()],
+                    threads: 4,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Running {
+                        node_id: "node-a".to_string(),
+                        started_at: now,
+                        pid: Some(1234),
+                    },
+                    assigned_node: Some("node-a".to_string()),
+                    exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
+                }],
+            )
+            .await;
+        store
+            .update_status(&push_job.id, JobStatus::Running { started_at: now })
+            .await;
+
+        let pr_job = Job {
+            id: "job-pr-winner".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/test".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(1),
+            pr_number: Some(42),
+        };
+        let enq = store
+            .enqueue_job(pr_job, PathBuf::from("logs/pr.log"))
+            .await;
+        assert!(enq.superseded_jobs.contains(&push_job.id));
+
+        // Late worker completion reports arriving after supersede must never overwrite Skipped.
+        store
+            .update_stage_status(
+                &push_job.id,
+                "clippy-check",
+                StageStatus::Failed {
+                    error: "Process exited with code -1".to_string(),
+                },
+            )
+            .await;
+        store
+            .update_stage_status(
+                &push_job.id,
+                "clippy-check",
+                StageStatus::Completed {
+                    duration_secs: 5,
+                    exit_code: 0,
+                },
+            )
+            .await;
+
+        let rec = store.get_job(&push_job.id).await.unwrap();
+        assert!(matches!(rec.status, JobStatus::Skipped { .. }));
+        assert!(matches!(
+            rec.stages[0].status,
+            StageStatus::Skipped { ref reason } if reason.contains("Superseded")
+        ));
+
+        // Also guard a single skipped stage on an active Running job.
+        let active_job = Job {
+            id: "job-active-opt-skip".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example2".to_string(),
+            clone_url: "https://github.com/LMA1980/example2.git".to_string(),
+            commit_sha: "abcdef0123456789".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: Some(43),
+        };
+        store
+            .enqueue_job(active_job.clone(), PathBuf::from("logs/opt.log"))
+            .await;
+        store
+            .set_stages(
+                &active_job.id,
+                vec![StageRecord {
+                    id: "bench_kva23".to_string(),
+                    name: "Bench".to_string(),
+                    tags: vec!["kva23".to_string()],
+                    threads: 4,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                    skip_if_unavailable: true,
+                    skip_reason_code: None,
+                    skip_capability: None,
+                }],
+            )
+            .await;
+        store
+            .mark_stage_skipped_unavailable(
+                &active_job.id,
+                "bench_kva23",
+                "No KVA23 node accessible.".to_string(),
+                "no_capable_node".to_string(),
+                "KVA23".to_string(),
+            )
+            .await;
+        store
+            .update_stage_status(
+                &active_job.id,
+                "bench_kva23",
+                StageStatus::Failed {
+                    error: "late failure".to_string(),
+                },
+            )
+            .await;
+        let active_rec = store.get_job(&active_job.id).await.unwrap();
+        assert!(matches!(
+            active_rec.stages[0].status,
+            StageStatus::Skipped { .. }
+        ));
     }
 }

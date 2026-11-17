@@ -22,10 +22,216 @@ use mu_ci_ipc::{
 
 use crate::aggregator::{aggregate_metrics, append_logs, format_log_entries};
 use crate::cluster::WorkerCommand;
-use crate::job::StageStatus;
-use crate::storage_backend::{job_root_trace_context, job_stage_trace_context};
+use crate::job::{JobRecord, JobStatus, StageStatus};
+use crate::storage_backend::{
+    job_root_trace_context, job_stage_trace_context, match_explicit_ci_failure_kind, CiFailureKind,
+};
 use crate::webhook::AppState;
 use mu_observable_ipc::{encode_hex, OtelSpanEntry};
+
+/// Classified stage completion status and OpenTelemetry span metadata for `ci.stage.dispatch:*`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StageDispatchClassification {
+    pub stage_status: StageStatus,
+    pub span_status_code: String,
+    pub span_status_message: Option<String>,
+    pub outcome: &'static str,
+    pub failure_class: &'static str,
+    pub superseded: bool,
+    pub cancelled: bool,
+}
+
+/// Classifies an incoming [`StageCompletionReport`] against existing job/stage state so ordinary
+/// user CI outcomes (`101`), timeouts (`124`), cancellations (`130`), and late `SIGTERM` completions
+/// on superseded/skipped jobs record `"OK"` span status with structured outcome attributes, while
+/// reserving `"ERROR"` strictly for controller/worker infrastructure faults (`#218`, `#222`).
+#[must_use]
+pub(crate) fn classify_stage_completion(
+    report: &StageCompletionReport,
+    existing_job: Option<&JobRecord>,
+) -> StageDispatchClassification {
+    let job_skip_reason = existing_job.and_then(|j| match &j.status {
+        JobStatus::Skipped { reason } => Some(reason.as_str()),
+        _ => None,
+    });
+    let stage_skip_reason = existing_job
+        .and_then(|j| j.stages.iter().find(|s| s.id == report.stage_id))
+        .and_then(|s| match &s.status {
+            StageStatus::Skipped { reason } => Some(reason.as_str()),
+            _ => None,
+        });
+
+    if let Some(reason) = stage_skip_reason.or(job_skip_reason) {
+        let is_superseded = reason.to_ascii_lowercase().contains("superseded");
+        let label = if is_superseded {
+            "superseded"
+        } else {
+            "cancelled"
+        };
+        return StageDispatchClassification {
+            stage_status: StageStatus::Skipped {
+                reason: reason.to_string(),
+            },
+            span_status_code: "OK".to_string(),
+            span_status_message: None,
+            outcome: label,
+            failure_class: label,
+            superseded: is_superseded,
+            cancelled: !is_superseded,
+        };
+    }
+
+    if let Some(ref denied) = report.security_grant_denied {
+        let err = report
+            .error_message
+            .clone()
+            .unwrap_or_else(|| format!("Security grant denied: {denied:?}"));
+        return StageDispatchClassification {
+            stage_status: StageStatus::Failed { error: err.clone() },
+            span_status_code: "ERROR".to_string(),
+            span_status_message: Some(err),
+            outcome: "infra_failure",
+            failure_class: "security_grant_denied",
+            superseded: false,
+            cancelled: false,
+        };
+    }
+
+    if report.exit_code == 0 {
+        return StageDispatchClassification {
+            stage_status: StageStatus::Completed {
+                duration_secs: report.duration_secs,
+                exit_code: 0,
+            },
+            span_status_code: "OK".to_string(),
+            span_status_message: None,
+            outcome: "passed",
+            failure_class: "none",
+            superseded: false,
+            cancelled: false,
+        };
+    }
+
+    let job_already_terminal = existing_job.is_some_and(|j| {
+        matches!(
+            j.status,
+            JobStatus::Completed { .. } | JobStatus::Failed { .. } | JobStatus::Skipped { .. }
+        )
+    });
+    let explicit_kind = report
+        .error_message
+        .as_deref()
+        .and_then(match_explicit_ci_failure_kind);
+
+    let kind = if job_already_terminal
+        && (report.exit_code == 130
+            || report.exit_code < 0
+            || matches!(
+                explicit_kind,
+                Some(CiFailureKind::Cancelled | CiFailureKind::Superseded)
+            )) {
+        CiFailureKind::Cancelled
+    } else if let Some(explicit) = explicit_kind {
+        match explicit {
+            CiFailureKind::UserCode => classify_exit_code(report.exit_code),
+            other => other,
+        }
+    } else {
+        classify_exit_code(report.exit_code)
+    };
+
+    let err_msg = report
+        .error_message
+        .clone()
+        .unwrap_or_else(|| format!("Process exited with code {}", report.exit_code));
+
+    let stage_status = if job_already_terminal
+        && matches!(kind, CiFailureKind::Cancelled | CiFailureKind::Superseded)
+    {
+        StageStatus::Skipped {
+            reason: err_msg.clone(),
+        }
+    } else {
+        StageStatus::Failed {
+            error: err_msg.clone(),
+        }
+    };
+
+    let span_status_message = if kind == CiFailureKind::InfraError {
+        Some(err_msg)
+    } else {
+        None
+    };
+
+    StageDispatchClassification {
+        stage_status,
+        span_status_code: kind.span_status_code().to_string(),
+        span_status_message,
+        outcome: kind.outcome_label(),
+        failure_class: kind.failure_class_label(),
+        superseded: kind == CiFailureKind::Superseded,
+        cancelled: kind == CiFailureKind::Cancelled,
+    }
+}
+
+const fn classify_exit_code(exit_code: i32) -> CiFailureKind {
+    match exit_code {
+        130 => CiFailureKind::Cancelled,
+        124 => CiFailureKind::UserTimeout,
+        126 | 127 => CiFailureKind::InfraError,
+        c if c < 0 => CiFailureKind::InfraError,
+        _ => CiFailureKind::UserCode,
+    }
+}
+
+/// Builds the controller `ci.stage.dispatch:*` [`OtelSpanEntry`] from a classified [`StageCompletionReport`].
+#[must_use]
+pub(crate) fn build_stage_dispatch_span(
+    report: &StageCompletionReport,
+    existing_job: Option<&JobRecord>,
+    node_id: &str,
+    now_ns: i64,
+) -> (StageDispatchClassification, OtelSpanEntry) {
+    let classification = classify_stage_completion(report, existing_job);
+    let commit_sha = existing_job
+        .map(|j| j.job.commit_sha.as_str())
+        .unwrap_or("");
+    let root_ctx = job_root_trace_context(&report.job_id, commit_sha);
+    let stage_ctx = job_stage_trace_context(&report.job_id, commit_sha, &report.stage_id);
+    let duration_ns = report.duration_secs.saturating_mul(1_000_000_000);
+    let start_ns = (now_ns - duration_ns as i64).max(0);
+    let mut attrs = serde_json::json!({
+        "job_id": report.job_id,
+        "stage_id": report.stage_id,
+        "exit_code": report.exit_code,
+        "ci.outcome": classification.outcome,
+        "ci.failure_class": classification.failure_class,
+    });
+    if let Some(obj) = attrs.as_object_mut() {
+        if classification.superseded {
+            obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+        }
+        if classification.cancelled {
+            obj.insert("cancelled".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    let span = OtelSpanEntry {
+        trace_id: encode_hex(&stage_ctx.trace_id),
+        span_id: encode_hex(&stage_ctx.span_id),
+        parent_span_id: Some(encode_hex(&root_ctx.span_id)),
+        service_name: "mu-ci-controller".to_string(),
+        node_id: node_id.to_string(),
+        span_name: format!("ci.stage.dispatch:{}", report.stage_id),
+        span_kind: "INTERNAL".to_string(),
+        start_time_unix_nano: start_ns,
+        end_time_unix_nano: now_ns,
+        duration_ns,
+        status_code: classification.span_status_code.clone(),
+        status_message: classification.span_status_message.clone(),
+        attributes_json: attrs.to_string(),
+    };
+    (classification, span)
+}
 
 #[derive(Deserialize)]
 pub struct TunnelQuery {
@@ -309,66 +515,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         "Stage completed by worker"
                                     );
 
-                                    let status = if report.exit_code == 0 {
-                                        StageStatus::Completed {
-                                            duration_secs: report.duration_secs,
-                                            exit_code: report.exit_code,
-                                        }
-                                    } else {
-                                        StageStatus::Failed {
-                                            error: report.error_message.clone().unwrap_or_else(|| {
-                                                format!("Process exited with code {}", report.exit_code)
-                                            }),
-                                        }
-                                    };
-
-                                    // Flush any buffered stage logs and release the stage slot so any job woken by
-                                    // `update_stage_status` / `notify_event` sees the freed node slot and completed status.
+                                    // Flush any buffered stage logs and inspect existing job/stage status
+                                    // before classifying late worker completions and releasing the slot.
                                     state.job_store.flush_job_log(Some(&report.job_id));
 
-                                    // Emit stage W3C trace span to MuObserve telemetry
-                                    let commit_sha = state
-                                        .job_store
-                                        .get_job(&report.job_id)
-                                        .await
-                                        .map(|j| j.job.commit_sha)
-                                        .unwrap_or_default();
-                                    let root_ctx =
-                                        job_root_trace_context(&report.job_id, &commit_sha);
-                                    let stage_ctx = job_stage_trace_context(
-                                        &report.job_id,
-                                        &commit_sha,
-                                        &report.stage_id,
-                                    );
+                                    let existing_job =
+                                        state.job_store.get_job(&report.job_id).await;
                                     let now_ns = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_nanos() as i64;
-                                    let duration_ns = report.duration_secs.saturating_mul(1_000_000_000);
-                                    let start_ns = (now_ns - duration_ns as i64).max(0);
-                                    let (span_status_code, span_status_msg) = if report.exit_code == 0 {
-                                        ("OK".to_string(), None)
-                                    } else {
-                                        ("ERROR".to_string(), report.error_message.clone())
-                                    };
-                                    let span_entry = OtelSpanEntry {
-                                        trace_id: encode_hex(&stage_ctx.trace_id),
-                                        span_id: encode_hex(&stage_ctx.span_id),
-                                        parent_span_id: Some(encode_hex(&root_ctx.span_id)),
-                                        service_name: "mu-ci-controller".to_string(),
-                                        node_id: node_id.clone(),
-                                        span_name: format!("ci.stage.dispatch:{}", report.stage_id),
-                                        span_kind: "INTERNAL".to_string(),
-                                        start_time_unix_nano: start_ns,
-                                        end_time_unix_nano: now_ns,
-                                        duration_ns,
-                                        status_code: span_status_code,
-                                        status_message: span_status_msg,
-                                        attributes_json: format!(
-                                            r#"{{"job_id":"{}","stage_id":"{}","exit_code":{}}}"#,
-                                            report.job_id, report.stage_id, report.exit_code
-                                        ),
-                                    };
+                                    let (classification, span_entry) = build_stage_dispatch_span(
+                                        &report,
+                                        existing_job.as_ref(),
+                                        &node_id,
+                                        now_ns,
+                                    );
                                     state.job_store.emit_trace_spans(&[span_entry]);
 
                                     state
@@ -384,7 +546,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         .update_stage_status(
                                             &report.job_id,
                                             &report.stage_id,
-                                            status,
+                                            classification.stage_status,
                                         )
                                         .await;
                                     state.job_store.notify_event();
@@ -616,5 +778,202 @@ pub(crate) async fn append_note_to_job_log_bounded(
     match write_res {
         Ok(Ok(Ok(()))) => state.job_store.mark_disk_io_healthy(),
         _ => state.job_store.mark_disk_io_unhealthy(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::{Job, JobStore, StageRecord};
+    use chrono::Utc;
+    use mu_ci_ipc::SecurityGrantDenied;
+    use std::path::PathBuf;
+
+    fn sample_report(exit_code: i32, error_message: Option<&str>) -> StageCompletionReport {
+        StageCompletionReport {
+            job_id: "job-test-1".to_string(),
+            stage_id: "clippy-check".to_string(),
+            exit_code,
+            duration_secs: 12,
+            error_message: error_message.map(ToString::to_string),
+            security_grant_denied: None,
+            traceparent: None,
+        }
+    }
+
+    #[test]
+    fn stage_dispatch_span_classifies_user_ci_outcomes_cancellations_and_infra_faults() {
+        // 1. Clean pass (exit 0)
+        let (cls_ok, span_ok) =
+            build_stage_dispatch_span(&sample_report(0, None), None, "node-a", 20_000_000_000);
+        assert_eq!(span_ok.status_code, "OK");
+        assert_eq!(span_ok.status_message, None);
+        assert_eq!(cls_ok.outcome, "passed");
+        assert_eq!(cls_ok.failure_class, "none");
+        assert!(matches!(
+            cls_ok.stage_status,
+            StageStatus::Completed { exit_code: 0, .. }
+        ));
+
+        // 2. Ordinary user CI lint/test exit code (101) -> OK span status with user_failure attrs
+        let (cls_101, span_101) = build_stage_dispatch_span(
+            &sample_report(
+                101,
+                Some("Tool 'cargo-clippy' exited with status code Some(101)"),
+            ),
+            None,
+            "node-a",
+            20_000_000_000,
+        );
+        assert_eq!(span_101.status_code, "OK");
+        assert_eq!(span_101.status_message, None);
+        assert_eq!(cls_101.outcome, "user_failure");
+        assert_eq!(cls_101.failure_class, "user_code");
+        let attrs_101: serde_json::Value = serde_json::from_str(&span_101.attributes_json).unwrap();
+        assert_eq!(attrs_101["exit_code"], 101);
+        assert_eq!(attrs_101["ci.outcome"], "user_failure");
+        assert_eq!(attrs_101["ci.failure_class"], "user_code");
+
+        // 3. Pre-permit cancellation (130) -> OK span status
+        let (cls_130, span_130) = build_stage_dispatch_span(
+            &sample_report(130, Some("Stage cancelled before permit acquisition")),
+            None,
+            "node-a",
+            20_000_000_000,
+        );
+        assert_eq!(span_130.status_code, "OK");
+        assert_eq!(cls_130.outcome, "cancelled");
+        assert!(cls_130.cancelled);
+
+        // 4. User stage timeout (124) -> OK span status
+        let (cls_124, span_124) = build_stage_dispatch_span(
+            &sample_report(124, Some("Stage execution timed out after 1200s")),
+            None,
+            "node-a",
+            20_000_000_000,
+        );
+        assert_eq!(span_124.status_code, "OK");
+        assert_eq!(cls_124.outcome, "timeout");
+        assert_eq!(cls_124.failure_class, "user_timeout");
+
+        // 5. Unrequested crash (-1) on active/unknown job -> ERROR span status
+        let (cls_crash, span_crash) = build_stage_dispatch_span(
+            &sample_report(-1, Some("Failed to spawn tool process 'cargo-test'")),
+            None,
+            "node-a",
+            20_000_000_000,
+        );
+        assert_eq!(span_crash.status_code, "ERROR");
+        assert!(span_crash.status_message.is_some());
+        assert_eq!(cls_crash.outcome, "infra_failure");
+
+        // 6. SecurityGrantDenied -> ERROR span status
+        let mut denied_report = sample_report(1, Some("Sandbox policy violation"));
+        denied_report.security_grant_denied = Some(SecurityGrantDenied {
+            job_id: "job-test-1".to_string(),
+            stage_id: "clippy-check".to_string(),
+            violated_layer: "cgroupv2".to_string(),
+            offending_field: "max_pids".to_string(),
+            requested_value: "1024".to_string(),
+            ceiling_value: "256".to_string(),
+        });
+        let (cls_sec, span_sec) =
+            build_stage_dispatch_span(&denied_report, None, "node-a", 20_000_000_000);
+        assert_eq!(span_sec.status_code, "ERROR");
+        assert_eq!(cls_sec.outcome, "infra_failure");
+        assert_eq!(cls_sec.failure_class, "security_grant_denied");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn late_stage_completion_on_superseded_job_emits_ok_span_and_preserves_skipped() {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+
+        let push_job = Job {
+            id: "job-superseded-tunnel".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/telemetry".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: None,
+        };
+        store
+            .enqueue_job(push_job.clone(), PathBuf::from("logs/push.log"))
+            .await;
+        store
+            .set_stages(
+                &push_job.id,
+                vec![StageRecord {
+                    id: "test-check".to_string(),
+                    name: "Test".to_string(),
+                    tags: vec!["x86_64".to_string()],
+                    threads: 4,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Running {
+                        node_id: "node-a".to_string(),
+                        started_at: now,
+                        pid: Some(777),
+                    },
+                    assigned_node: Some("node-a".to_string()),
+                    exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
+                }],
+            )
+            .await;
+        store
+            .update_status(&push_job.id, JobStatus::Running { started_at: now })
+            .await;
+
+        let pr_job = Job {
+            id: "job-pr-superseder".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/telemetry".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(1),
+            pr_number: Some(9),
+        };
+        store
+            .enqueue_job(pr_job, PathBuf::from("logs/pr.log"))
+            .await;
+
+        let existing = store.get_job(&push_job.id).await;
+        let late_report = StageCompletionReport {
+            job_id: push_job.id.clone(),
+            stage_id: "test-check".to_string(),
+            exit_code: -1,
+            duration_secs: 4,
+            error_message: Some("Tool 'cargo-test' terminated by SIGTERM".to_string()),
+            security_grant_denied: None,
+            traceparent: None,
+        };
+        let (cls, span) =
+            build_stage_dispatch_span(&late_report, existing.as_ref(), "node-a", 10_000_000_000);
+        assert_eq!(span.status_code, "OK");
+        assert_eq!(span.status_message, None);
+        assert!(matches!(cls.stage_status, StageStatus::Skipped { .. }));
+        let attrs: serde_json::Value = serde_json::from_str(&span.attributes_json).unwrap();
+        assert_eq!(attrs["ci.outcome"], "superseded");
+        assert_eq!(attrs["superseded"], true);
+
+        store
+            .update_stage_status(&push_job.id, "test-check", cls.stage_status)
+            .await;
+        let after = store.get_job(&push_job.id).await.unwrap();
+        assert!(matches!(after.status, JobStatus::Skipped { .. }));
+        assert!(matches!(
+            after.stages[0].status,
+            StageStatus::Skipped { .. }
+        ));
     }
 }
