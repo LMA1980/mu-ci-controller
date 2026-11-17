@@ -581,6 +581,15 @@ impl ActionRunnerWorkflow {
         })
     }
 
+    /// Return `true` when any task in `stage.tasks` invokes `cargo-miri`.
+    pub fn stage_invokes_miri(&self, stage: &StageConfig) -> bool {
+        stage.tasks.iter().any(|tid| {
+            self.tasks
+                .get(tid)
+                .is_some_and(|tcfg| tcfg.tool.trim().eq_ignore_ascii_case("cargo-miri"))
+        })
+    }
+
     /// Resolve effective worker capability tags for a stage, appending `"sccache"` when mandatory.
     pub fn effective_stage_tags(&self, stage: &StageConfig) -> Vec<String> {
         let mut tags = stage.tags.clone();
@@ -1293,5 +1302,39 @@ on_action:
         assert!(parse_rust_semver("latest").is_err());
         assert!(parse_rust_semver("1").is_err());
         assert!(parse_rust_semver("1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn test_stage_invokes_miri_detection() {
+        let yaml = r#"
+version: "3"
+name: "Miri Detection Pipeline"
+tasks:
+  test-task:
+    tool: "cargo-test"
+    args: ["--workspace"]
+  miri-task:
+    tool: "cargo-miri"
+    args: ["test", "--workspace", "--lib"]
+stages:
+  - id: test-check
+    name: "Test"
+    tasks: ["test-task"]
+    tags: ["test"]
+  - id: miri-check
+    name: "Miri"
+    tasks: ["miri-task"]
+    tags: ["test", "aarch64"]
+  - id: combo-check
+    name: "Combo"
+    tasks: ["test-task", "miri-task"]
+    tags: ["aarch64"]
+on_action:
+  pull_request: ["test-check", "miri-check", "combo-check"]
+"#;
+        let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("workflow parses");
+        assert!(!wf.stage_invokes_miri(&wf.stages[0]));
+        assert!(wf.stage_invokes_miri(&wf.stages[1]));
+        assert!(wf.stage_invokes_miri(&wf.stages[2]));
     }
 }

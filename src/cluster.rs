@@ -234,6 +234,34 @@ const EXPLICIT_AUX_ARCH_TAGS: &[&str] = &["aarch64", "arm64", "rpi4"];
 
 const LOW_RAM_THRESHOLD_MB: u64 = 8192;
 
+/// Returns `true` when a worker architecture string identifies an ARM (`aarch64` / `arm*`) host.
+#[must_use]
+pub fn is_arm_arch(arch: &str) -> bool {
+    let lower = arch.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "aarch64" | "arm64" | "arm")
+        || lower.starts_with("aarch64-")
+        || lower.starts_with("arm-")
+        || lower.starts_with("armv")
+}
+
+/// Returns `true` when a stage capability tag explicitly targets ARM hardware.
+#[must_use]
+pub fn is_arm_target_tag(tag: &str) -> bool {
+    let lower = tag.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "aarch64" | "arm64" | "arm" | "rpi4" | "worker-aarch64"
+    ) || lower.starts_with("aarch64-")
+        || lower.starts_with("arm-")
+        || lower.starts_with("armv")
+}
+
+/// Returns `true` when `required_tags` explicitly targets an ARM worker.
+#[must_use]
+pub fn stage_targets_arm(required_tags: &[String]) -> bool {
+    required_tags.iter().any(|req| is_arm_target_tag(req))
+}
+
 /// Computes `(hw_tier, low_ram_tier)` for ranking eligible workers (`0` = primary, `1` = overflow).
 ///
 /// - `hw_tier = 1` when a worker advertises hardware-verification tags (`HW_EXCLUSIVE_TAGS`) and
@@ -277,9 +305,14 @@ fn worker_is_live_and_capable(
     timeout_secs: i64,
     required_tags: &[String],
     required_toolchain: Option<&str>,
+    invokes_miri: bool,
 ) -> bool {
     let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
     if secs_since_seen > timeout_secs {
+        return false;
+    }
+    if is_arm_arch(&worker.registration.arch) && (invokes_miri || !stage_targets_arm(required_tags))
+    {
         return false;
     }
     if let Some(tc) = required_toolchain {
@@ -299,18 +332,16 @@ fn worker_is_live_and_capable(
             .all(|req| req == "default" || node_tags.contains(req.as_str()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn worker_can_accept_stage(
+fn worker_has_slot_capacity(
     worker: &ActiveWorker,
     now: DateTime<Utc>,
     timeout_secs: i64,
-    required_tags: &[String],
-    required_toolchain: Option<&str>,
     exclusive: bool,
     max_concurrent_per_node: Option<u32>,
     include_pending_claims: bool,
 ) -> bool {
-    if !worker_is_live_and_capable(worker, now, timeout_secs, required_tags, required_toolchain) {
+    let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+    if secs_since_seen > timeout_secs {
         return false;
     }
     if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
@@ -328,23 +359,63 @@ fn worker_can_accept_stage(
         worker.leased_stages.len()
     };
     if exclusive {
-        if occupied > 0 {
-            return false;
-        }
+        occupied == 0
     } else {
         let limit = effective_slot_limit(worker.registration.max_slots, max_concurrent_per_node);
-        if (occupied as u32) >= limit {
-            return false;
-        }
+        (occupied as u32) < limit
     }
+}
 
-    true
+fn worker_has_unleased_slot(
+    worker: &ActiveWorker,
+    now: DateTime<Utc>,
+    timeout_secs: i64,
+    include_pending_claims: bool,
+) -> bool {
+    worker_has_slot_capacity(
+        worker,
+        now,
+        timeout_secs,
+        false,
+        None,
+        include_pending_claims,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_can_accept_stage(
+    worker: &ActiveWorker,
+    now: DateTime<Utc>,
+    timeout_secs: i64,
+    required_tags: &[String],
+    required_toolchain: Option<&str>,
+    exclusive: bool,
+    max_concurrent_per_node: Option<u32>,
+    include_pending_claims: bool,
+    invokes_miri: bool,
+) -> bool {
+    worker_is_live_and_capable(
+        worker,
+        now,
+        timeout_secs,
+        required_tags,
+        required_toolchain,
+        invokes_miri,
+    ) && worker_has_slot_capacity(
+        worker,
+        now,
+        timeout_secs,
+        exclusive,
+        max_concurrent_per_node,
+        include_pending_claims,
+    )
 }
 
 #[derive(Clone, Default)]
 pub struct ClusterRegistry {
     workers: Arc<RwLock<HashMap<String, ActiveWorker>>>,
     stage_concurrency_limits: Arc<std::sync::RwLock<HashMap<(String, String), u32>>>,
+    stage_miri_flags: Arc<std::sync::RwLock<HashSet<(String, String)>>>,
     dispatch_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -353,6 +424,7 @@ impl ClusterRegistry {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
             stage_concurrency_limits: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            stage_miri_flags: Arc::new(std::sync::RwLock::new(HashSet::new())),
             dispatch_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -381,6 +453,30 @@ impl ClusterRegistry {
         guard
             .get(&(job_id.to_string(), stage_id.to_string()))
             .copied()
+    }
+
+    pub fn set_stage_miri_flags(
+        &self,
+        job_id: &str,
+        miri_stage_ids: impl IntoIterator<Item = String>,
+    ) {
+        let mut guard = self
+            .stage_miri_flags
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(jid, _)| jid != job_id);
+        for stage_id in miri_stage_ids {
+            guard.insert((job_id.to_string(), stage_id));
+        }
+    }
+
+    #[must_use]
+    pub fn stage_invokes_miri(&self, job_id: &str, stage_id: &str) -> bool {
+        let guard = self
+            .stage_miri_flags
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.contains(&(job_id.to_string(), stage_id.to_string()))
     }
 
     pub async fn register(
@@ -501,6 +597,7 @@ impl ClusterRegistry {
         // 4. Round-robin (`last_dispatched_seq`) and CPU load (`load_int`) so eligible peers in
         //    the same tier share stages evenly without penalizing nodes advertising extra tags.
         let timeout_secs = heartbeat_timeout_secs();
+        let invokes_miri = self.stage_invokes_miri(job_id, stage_id);
         type NodeDispatchScore = (usize, u8, u8, u64, i32);
         let mut best_node: Option<(String, NodeDispatchScore)> = None;
 
@@ -514,6 +611,7 @@ impl ClusterRegistry {
                 exclusive,
                 max_concurrent_per_node,
                 false,
+                invokes_miri,
             ) {
                 continue;
             }
@@ -601,6 +699,10 @@ impl ClusterRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(jid, _), _| jid != job_id);
+        self.stage_miri_flags
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(jid, _)| jid != job_id);
         let mut to_cancel = Vec::new();
         {
             let mut workers = self.workers.write().await;
@@ -791,6 +893,28 @@ impl ClusterRegistry {
                 exclusive,
                 max_concurrent_per_node,
                 true,
+                false,
+            )
+        })
+    }
+
+    async fn has_live_capable_worker_with_miri(
+        &self,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+        invokes_miri: bool,
+    ) -> bool {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+        let timeout_secs = heartbeat_timeout_secs();
+        workers.values().any(|worker| {
+            worker_is_live_and_capable(
+                worker,
+                now,
+                timeout_secs,
+                required_tags,
+                required_toolchain,
+                invokes_miri,
             )
         })
     }
@@ -802,12 +926,22 @@ impl ClusterRegistry {
         required_tags: &[String],
         required_toolchain: Option<&str>,
     ) -> bool {
-        let workers = self.workers.read().await;
-        let now = Utc::now();
-        let timeout_secs = heartbeat_timeout_secs();
-        workers.values().any(|worker| {
-            worker_is_live_and_capable(worker, now, timeout_secs, required_tags, required_toolchain)
-        })
+        self.has_live_capable_worker_with_miri(required_tags, required_toolchain, false)
+            .await
+    }
+
+    /// Returns `true` when at least one online (`Live`) worker node satisfies `required_tags`,
+    /// `required_toolchain`, and stage-level `cargo-miri` restrictions for `(job_id, stage_id)`.
+    pub async fn has_live_capable_worker_for_stage(
+        &self,
+        job_id: &str,
+        stage_id: &str,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+    ) -> bool {
+        let invokes_miri = self.stage_invokes_miri(job_id, stage_id);
+        self.has_live_capable_worker_with_miri(required_tags, required_toolchain, invokes_miri)
+            .await
     }
 
     /// Checks whether any online worker node currently has an available execution slot.
@@ -816,9 +950,9 @@ impl ClusterRegistry {
         let now = Utc::now();
         let timeout_secs = heartbeat_timeout_secs();
 
-        workers.values().any(|worker| {
-            worker_can_accept_stage(worker, now, timeout_secs, &[], None, false, None, true)
-        })
+        workers
+            .values()
+            .any(|worker| worker_has_unleased_slot(worker, now, timeout_secs, true))
     }
 
     /// Checks whether any worker node currently holds an active stage lease (or exclusive lock)
@@ -872,19 +1006,20 @@ impl ClusterRegistry {
         }
 
         // 2. Check if stages.is_empty()
+        type EmptyClaimReserveScore = (u8, u8, u8, usize, i32);
         type ClaimReserveScore = (u8, u8, usize, i32);
         if stages.is_empty() {
-            let mut best_node: Option<(String, ClaimReserveScore)> = None;
+            let mut best_node: Option<(String, EmptyClaimReserveScore)> = None;
             for (node_id, worker) in workers.iter() {
-                if !worker_can_accept_stage(worker, now, timeout_secs, &[], None, false, None, true)
-                {
+                if !worker_has_unleased_slot(worker, now, timeout_secs, true) {
                     continue;
                 }
 
+                let arm_tier = u8::from(is_arm_arch(&worker.registration.arch));
                 let (hw_tier, low_ram_tier) = worker_dispatch_tiers(worker, &[]);
                 let tag_count = worker.registration.tags.len();
                 let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let score = (hw_tier, low_ram_tier, tag_count, load_int);
+                let score = (arm_tier, hw_tier, low_ram_tier, tag_count, load_int);
                 if match &best_node {
                     None => true,
                     Some((best_id, best_score)) => {
@@ -924,6 +1059,7 @@ impl ClusterRegistry {
             }
 
             let stage_limit = self.stage_concurrency_limit(job_id, &stage.id);
+            let invokes_miri = self.stage_invokes_miri(job_id, &stage.id);
             let mut best_node: Option<(String, ClaimReserveScore)> = None;
             for (node_id, worker) in workers.iter() {
                 if !worker_can_accept_stage(
@@ -935,6 +1071,7 @@ impl ClusterRegistry {
                     stage.exclusive,
                     stage_limit,
                     true,
+                    invokes_miri,
                 ) {
                     continue;
                 }
@@ -969,6 +1106,7 @@ impl ClusterRegistry {
                         timeout_secs,
                         &stage.tags,
                         stage.toolchain.as_deref(),
+                        invokes_miri,
                     )
                 })
             {
@@ -1642,14 +1780,28 @@ mod tests {
             .release_stage_slot("node-a", "job-1", "default-build")
             .await;
 
-        // 2. Explicitly tagged hygiene stage ("fmt") treats both workers as tier 0
-        let l2 = cluster
+        // 2. Non-ARM hygiene stage ("fmt") must never route onto an ARM worker even when it
+        //    advertises "fmt"; only explicit ARM-targeted stages route to worker-aarch64.
+        let l2_non_arm = cluster
             .lease_slot("job-2", "fmt-1", &["fmt".to_string()], None, false)
             .await
-            .expect("should leaseworker-aarch64 (seq 0 < seq 1)");
-        assert_eq!(l2.0, "worker-aarch64");
+            .expect("should lease node-a rather than worker-aarch64 for non-ARM fmt stage");
+        assert_eq!(l2_non_arm.0, "node-a");
+        cluster.release_stage_slot("node-a", "job-2", "fmt-1").await;
+
+        let l2_arm = cluster
+            .lease_slot(
+                "job-2",
+                "fmt-arm-1",
+                &["aarch64".to_string(), "fmt".to_string()],
+                None,
+                false,
+            )
+            .await
+            .expect("should lease worker-aarch64 for explicit aarch64 stage");
+        assert_eq!(l2_arm.0, "worker-aarch64");
         cluster
-            .release_stage_slot("worker-aarch64", "job-2", "fmt-1")
+            .release_stage_slot("worker-aarch64", "job-2", "fmt-arm-1")
             .await;
 
         // 3. When 4 GiB worker reports >= 90% memory used and < 256 MiB free, OOM guard blocks dispatch
@@ -1794,7 +1946,8 @@ mod tests {
         let cluster = ClusterRegistry::new();
         let (tx_a, _rx_a) = mpsc::channel(8);
         let (tx_b, _rx_b) = mpsc::channel(8);
-        let (tx_aux, _rx_aux) = mpsc::channel(8);
+        let (tx_low, _rx_low) = mpsc::channel(8);
+        let (tx_arm, _rx_arm) = mpsc::channel(8);
         let (tx_k3, _rx_k3) = mpsc::channel(8);
 
         let mut reg_a = make_reg(
@@ -1832,7 +1985,27 @@ mod tests {
         reg_b.ram_total_mb = 32768;
         cluster.register(reg_b, tx_b).await;
 
-        let mut reg_aux = make_reg(
+        let mut reg_low = make_reg(
+            "node-lowram",
+            &[
+                "x86_64",
+                "linux",
+                "fmt",
+                "docs",
+                "audit",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+                "sccache",
+            ],
+            1,
+        );
+        reg_low.ram_total_mb = 3793;
+        cluster.register(reg_low, tx_low).await;
+
+        let mut reg_arm = make_reg(
             "worker-aarch64",
             &[
                 "aarch64",
@@ -1851,9 +2024,9 @@ mod tests {
             ],
             1,
         );
-        reg_aux.arch = "aarch64".to_string();
-        reg_aux.ram_total_mb = 3793;
-        cluster.register(reg_aux, tx_aux).await;
+        reg_arm.arch = "aarch64".to_string();
+        reg_arm.ram_total_mb = 3793;
+        cluster.register(reg_arm, tx_arm).await;
 
         let mut reg_k3 = make_reg(
             "worker-riscv64",
@@ -1878,15 +2051,15 @@ mod tests {
             .expect("primary node-b");
         assert_eq!(l2.0, "node-b");
 
-        // 2. Once both >= 8 GiB x86_64 nodes are occupied, worker-aarch64 absorbs overflow
-        //    for riscv64 cross-compile / build / clippy / test BEFORE touching K3 silicon!
+        // 2. Once both >= 8 GiB x86_64 nodes are occupied, < 8 GiB non-ARM node-lowram absorbs
+        //    overflow BEFORE touching K3 silicon, while worker-aarch64 stays strictly isolated!
         let l3 = cluster
             .lease_slot("job-3", "riscv64-build-3", &req_riscv64, None, false)
             .await
-            .expect("overflow worker-aarch64");
-        assert_eq!(l3.0, "worker-aarch64");
+            .expect("overflow node-lowram");
+        assert_eq!(l3.0, "node-lowram");
 
-        // 3. If a 4th riscv64 stage arrives while node-a, node-b, and worker-aarch64 are all busy,
+        // 3. If a 4th riscv64 stage arrives while node-a, node-b, and node-lowram are all busy,
         //    worker-riscv64 takes last-resort overflow when tags match ("riscv64").
         let l4 = cluster
             .lease_slot(
@@ -1900,6 +2073,39 @@ mod tests {
             .expect("last-resort worker-riscv64");
         assert_eq!(l4.0, "worker-riscv64");
 
+        // 4. Even when all non-ARM nodes are saturated and worker-aarch64 is idle with matching
+        //    non-ARM tags, non-ARM stages must never spill onto worker-aarch64.
+        assert!(cluster
+            .lease_slot(
+                "job-5",
+                "riscv64-no-arm",
+                &["riscv64".to_string()],
+                None,
+                false
+            )
+            .await
+            .is_none());
+        assert!(cluster
+            .lease_slot("job-5", "build-no-arm", &["build".to_string()], None, false)
+            .await
+            .is_none());
+
+        // Explicit ARM stages still dispatch cleanly onto worker-aarch64.
+        let l_arm = cluster
+            .lease_slot(
+                "job-arm",
+                "arm-build",
+                &["aarch64".to_string(), "build".to_string()],
+                None,
+                false,
+            )
+            .await
+            .expect("explicit ARM stage must lease worker-aarch64");
+        assert_eq!(l_arm.0, "worker-aarch64");
+        cluster
+            .release_stage_slot("worker-aarch64", "job-arm", "arm-build")
+            .await;
+
         cluster
             .release_stage_slot("node-a", "job-1", "riscv64-build-1")
             .await;
@@ -1907,13 +2113,14 @@ mod tests {
             .release_stage_slot("node-b", "job-2", "riscv64-build-2")
             .await;
         cluster
-            .release_stage_slot("worker-aarch64", "job-3", "riscv64-build-3")
+            .release_stage_slot("node-lowram", "job-3", "riscv64-build-3")
             .await;
         cluster
             .release_stage_slot("worker-riscv64", "job-4", "riscv64-only-4")
             .await;
 
-        // 4. Verify sync_and_try_reserve_for_claim mirrors the exact same primary -> low-RAM overflow tiering
+        // 5. Verify sync_and_try_reserve_for_claim mirrors primary -> non-ARM low-RAM tiering and
+        //    never claims non-ARM build stages for worker-aarch64.
         let build_stages = vec![crate::job::StageRecord {
             id: "build-check".to_string(),
             name: "Build Workspace".to_string(),
@@ -1938,8 +2145,8 @@ mod tests {
                 "{jid} should reserve an available build slot"
             );
         }
-        // All 3 build-capable nodes (node-a, node-b, worker-aarch64) now hold pending claims;
-        // worker-riscv64 lacks the "build" tag, so a 4th claim returns false.
+        // All 3 non-ARM build-capable nodes (node-a, node-b, node-lowram) hold pending claims;
+        // worker-aarch64 is ineligible without an explicit ARM tag and worker-riscv64 lacks "build".
         active_unleased.insert("claim-4".to_string());
         assert!(
             !cluster
@@ -2099,5 +2306,251 @@ mod tests {
                 min_version: "1.80.0".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_arm_worker_restricted_to_explicit_arm_tags_under_miri() {
+        assert!(is_arm_arch("aarch64"));
+        assert!(is_arm_arch("arm64"));
+        assert!(is_arm_arch("armv7l"));
+        assert!(is_arm_arch("aarch64-unknown-linux-gnu"));
+        assert!(!is_arm_arch("x86_64"));
+        assert!(!is_arm_arch("riscv64"));
+
+        assert!(is_arm_target_tag("aarch64"));
+        assert!(is_arm_target_tag("arm64"));
+        assert!(is_arm_target_tag("arm"));
+        assert!(is_arm_target_tag("rpi4"));
+        assert!(is_arm_target_tag("worker-aarch64"));
+        assert!(!is_arm_target_tag("test"));
+        assert!(!is_arm_target_tag("riscv64"));
+
+        let (tx, _rx) = mpsc::channel(1);
+        let now = Utc::now();
+
+        let mut arm_reg = make_reg(
+            "worker-aarch64",
+            &[
+                "aarch64", "arm64", "rpi4", "fmt", "build", "test", "riscv64", "sccache",
+            ],
+            1,
+        );
+        arm_reg.arch = "aarch64".to_string();
+        let arm_worker = ActiveWorker {
+            registration: arm_reg,
+            leased_stages: HashSet::new(),
+            exclusive_lease: None,
+            pending_claims: HashSet::new(),
+            pending_exclusive_claim: None,
+            cpu_load_pct: 0.0,
+            ram_used_mb: 0,
+            last_heartbeat: now,
+            last_dispatched_seq: 0,
+            command_tx: tx.clone(),
+        };
+
+        let mut x86_reg = make_reg("node-a", &["x86_64", "fmt", "build", "test", "sccache"], 1);
+        x86_reg.arch = "x86_64".to_string();
+        let x86_worker = ActiveWorker {
+            registration: x86_reg,
+            leased_stages: HashSet::new(),
+            exclusive_lease: None,
+            pending_claims: HashSet::new(),
+            pending_exclusive_claim: None,
+            cpu_load_pct: 0.0,
+            ram_used_mb: 0,
+            last_heartbeat: now,
+            last_dispatched_seq: 0,
+            command_tx: tx,
+        };
+
+        for non_arm in [
+            vec![],
+            vec!["default".to_string()],
+            vec!["fmt".to_string()],
+            vec!["build".to_string()],
+            vec!["test".to_string()],
+            vec!["riscv64".to_string()],
+            vec!["sccache".to_string()],
+        ] {
+            assert!(!stage_targets_arm(&non_arm));
+            assert!(
+                !worker_is_live_and_capable(&arm_worker, now, 15, &non_arm, None, false),
+                "ARM worker must reject non-ARM tags {non_arm:?}"
+            );
+            assert!(
+                !worker_can_accept_stage(
+                    &arm_worker,
+                    now,
+                    15,
+                    &non_arm,
+                    None,
+                    false,
+                    None,
+                    true,
+                    false
+                ),
+                "ARM worker must not accept non-ARM stage {non_arm:?}"
+            );
+        }
+
+        for arm_tags in [
+            vec!["aarch64".to_string()],
+            vec!["arm64".to_string(), "build".to_string()],
+            vec!["rpi4".to_string()],
+        ] {
+            assert!(stage_targets_arm(&arm_tags));
+            assert!(
+                worker_is_live_and_capable(&arm_worker, now, 15, &arm_tags, None, false),
+                "ARM worker should accept non-Miri ARM tags {arm_tags:?}"
+            );
+            assert!(
+                !worker_is_live_and_capable(&arm_worker, now, 15, &arm_tags, None, true),
+                "ARM worker must strictly reject cargo-miri even for ARM tags {arm_tags:?}"
+            );
+        }
+
+        assert!(worker_is_live_and_capable(
+            &x86_worker,
+            now,
+            15,
+            &["test".to_string()],
+            None,
+            true
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_arm_worker_prohibited_from_cargo_miri_and_non_arm_stages() {
+        let cluster = ClusterRegistry::new();
+        let (tx_arm, _rx_arm) = mpsc::channel(4);
+        let (tx_x86, _rx_x86) = mpsc::channel(4);
+
+        let mut reg_arm = make_reg(
+            "worker-aarch64",
+            &["aarch64", "arm64", "rpi4", "fmt", "build", "test"],
+            1,
+        );
+        reg_arm.arch = "aarch64".to_string();
+        cluster.register(reg_arm, tx_arm).await;
+
+        let reg_x86 = make_reg("node-a", &["x86_64", "fmt", "build", "test"], 1);
+        cluster.register(reg_x86, tx_x86).await;
+
+        // 1. Even with matching tags, non-ARM stages never lease onto worker-aarch64.
+        for req in [vec![], vec!["default".to_string()], vec!["fmt".to_string()]] {
+            let leased = cluster
+                .lease_slot("job-non-arm", "non-arm-stage", &req, None, false)
+                .await
+                .expect("x86 worker should accept non-ARM stage");
+            assert_eq!(leased.0, "node-a");
+            cluster
+                .release_stage_slot("node-a", "job-non-arm", "non-arm-stage")
+                .await;
+        }
+
+        // 2. Registering a stage as invoking cargo-miri prohibits ARM admission even for ["aarch64"].
+        cluster.set_stage_miri_flags("job-miri", ["miri-arm".to_string(), "miri-x86".to_string()]);
+        assert!(cluster.stage_invokes_miri("job-miri", "miri-arm"));
+        assert!(!cluster.stage_invokes_miri("job-miri", "test-arm"));
+
+        assert!(
+            !cluster
+                .has_live_capable_worker_for_stage(
+                    "job-miri",
+                    "miri-arm",
+                    &["aarch64".to_string()],
+                    None
+                )
+                .await
+        );
+        assert!(cluster
+            .lease_slot(
+                "job-miri",
+                "miri-arm",
+                &["aarch64".to_string()],
+                None,
+                false
+            )
+            .await
+            .is_none());
+        assert!(cluster
+            .lease_slot(
+                "job-miri",
+                "miri-arm",
+                &["arm64".to_string(), "test".to_string()],
+                None,
+                false
+            )
+            .await
+            .is_none());
+
+        let miri_arm_stage = vec![crate::job::StageRecord {
+            id: "miri-arm".to_string(),
+            name: "Miri ARM".to_string(),
+            tags: vec!["aarch64".to_string()],
+            threads: 2,
+            toolchain: None,
+            depends_on: Vec::new(),
+            status: crate::job::StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
+        }];
+        let active = HashSet::from(["job-miri".to_string()]);
+        assert!(
+            !cluster
+                .sync_and_try_reserve_for_claim(&active, "job-miri", &miri_arm_stage)
+                .await
+        );
+
+        // If skip_if_unavailable is enabled on an ARM-tagged Miri stage, no capable worker exists
+        // so claim succeeds to mark it skipped immediately.
+        let mut miri_arm_skip = miri_arm_stage.clone();
+        miri_arm_skip[0].skip_if_unavailable = true;
+        assert!(
+            cluster
+                .sync_and_try_reserve_for_claim(&active, "job-miri", &miri_arm_skip)
+                .await
+        );
+
+        // Non-ARM Miri stage still dispatches normally to x86_64 node-a.
+        let miri_x86 = cluster
+            .lease_slot("job-miri", "miri-x86", &["test".to_string()], None, false)
+            .await
+            .expect("node-a should accept cargo-miri stage");
+        assert_eq!(miri_x86.0, "node-a");
+
+        // Non-Miri ARM stage dispatches normally to worker-aarch64.
+        assert!(
+            cluster
+                .has_live_capable_worker_for_stage(
+                    "job-miri",
+                    "test-arm",
+                    &["aarch64".to_string()],
+                    None
+                )
+                .await
+        );
+        let non_miri_arm = cluster
+            .lease_slot(
+                "job-miri",
+                "test-arm",
+                &["aarch64".to_string(), "test".to_string()],
+                None,
+                false,
+            )
+            .await
+            .expect("worker-aarch64 must accept non-Miri ARM stage");
+        assert_eq!(non_miri_arm.0, "worker-aarch64");
+
+        // Cancelling the job cleans up stage_miri_flags.
+        cluster
+            .cancel_and_release_job_slots("job-miri", "done")
+            .await;
+        assert!(!cluster.stage_invokes_miri("job-miri", "miri-arm"));
     }
 }

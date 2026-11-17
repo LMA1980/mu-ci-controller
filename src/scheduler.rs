@@ -599,6 +599,14 @@ impl DAGScheduler {
                 .iter()
                 .map(|s| (s.id.clone(), s.max_concurrent_per_node)),
         );
+        self.cluster.set_stage_miri_flags(
+            &job.id,
+            workflow
+                .stages
+                .iter()
+                .filter(|s| workflow.stage_invokes_miri(s))
+                .map(|s| s.id.clone()),
+        );
 
         // 3. Orchestration loop: evaluate DAG progression
         let stages_by_id: HashMap<String, StageConfig> = workflow
@@ -1227,7 +1235,12 @@ impl DAGScheduler {
         }
         if self
             .cluster
-            .has_live_capable_worker(required_tags, stage_cfg.toolchain.as_deref())
+            .has_live_capable_worker_for_stage(
+                &job.id,
+                &stage_cfg.id,
+                required_tags,
+                stage_cfg.toolchain.as_deref(),
+            )
             .await
         {
             return false;
