@@ -224,6 +224,25 @@ async fn wait_for_job_terminal(
     );
 }
 
+async fn wait_for_commit_status(
+    github_state: &Arc<MockGitHubState>,
+    sha: &str,
+    expected_state: &str,
+) {
+    for _ in 0..150 {
+        {
+            let statuses = github_state.statuses.lock().await;
+            if statuses
+                .iter()
+                .any(|s| s.sha == sha && s.state == expected_state)
+            {
+                return;
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_kva23_stage_skips_immediately_with_dedup_pr_comment_and_dag_completion() {
@@ -374,6 +393,7 @@ on_action:
             .body
             .contains("Stage 'bench_kva23' skipped for abcdef1: No KVA23 node accessible."));
     }
+    wait_for_commit_status(&github_state, &job_1.commit_sha, "success").await;
     {
         let statuses = github_state.statuses.lock().await;
         assert!(
@@ -435,6 +455,8 @@ on_action:
             .body
             .contains("Stage 'bench_kva23' skipped for fedcba9: No KVA23 node accessible."));
     }
+
+    wait_for_commit_status(&github_state, &job_2.commit_sha, "success").await;
 
     handle.abort();
 }
@@ -533,6 +555,7 @@ on_action:
         "no stage must dispatch when toolchain.min_version fails fast"
     );
 
+    wait_for_commit_status(&github_state, &job.commit_sha, "failure").await;
     let statuses = github_state.statuses.lock().await;
     assert!(statuses
         .iter()
