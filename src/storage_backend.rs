@@ -45,11 +45,15 @@ pub enum StorageBackendMode {
 }
 
 impl StorageBackendMode {
-    /// Resolves the storage backend mode from `ACTION_RUNNER_STORAGE_MODE` and `MUOBSERVE_CONTROL_ADDR`.
+    /// Resolves the storage backend mode from `MU_CI_CONTROLLER_STORAGE_MODE`
+    /// (falling back to `ACTION_RUNNER_STORAGE_MODE`) and `MUOBSERVE_CONTROL_ADDR`.
     #[must_use]
     pub fn from_env() -> Self {
-        if let Ok(raw) = std::env::var("ACTION_RUNNER_STORAGE_MODE") {
-            match raw.trim().to_ascii_lowercase().as_str() {
+        if let Some(raw) = crate::config::first_non_empty_env(&[
+            "MU_CI_CONTROLLER_STORAGE_MODE",
+            "ACTION_RUNNER_STORAGE_MODE",
+        ]) {
+            match raw.to_ascii_lowercase().as_str() {
                 "memory" | "in_memory" | "inmemory" => return Self::InMemory,
                 "remote" | "muobserve" | "muobserve_remote" => return Self::MuObserveRemote,
                 _ => {}

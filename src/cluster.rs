@@ -203,11 +203,12 @@ pub fn is_worker_memory_exhausted(ram_total_mb: u64, ram_used_mb: u64) -> bool {
 }
 
 fn heartbeat_timeout_secs() -> i64 {
-    std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(15)
+    crate::config::first_parsed_env::<i64>(&[
+        "MU_CI_CONTROLLER_HEARTBEAT_TIMEOUT_SECS",
+        "ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS",
+    ])
+    .filter(|&v| v > 0)
+    .unwrap_or(15)
 }
 
 fn effective_slot_limit(max_slots: u32, max_concurrent_per_node: Option<u32>) -> u32 {

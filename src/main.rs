@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(e) => {
-                            warn!("Invalid ACTION_RUNNER_QUIC_BIND address '{quic_bind}': {e}");
+                            warn!("Invalid QUIC bind address '{quic_bind}': {e}");
                         }
                     },
                     Err(e) => {

@@ -357,27 +357,34 @@ pub(crate) fn parse_retired_repos(raw: &str) -> Vec<String> {
 impl ConsoleConfig {
     /// Builds the production configuration.
     ///
-    /// - `ACTION_RUNNER_GITHUB_API_URL` (default `https://api.github.com`, `off` disables)
-    /// - `ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS` (default `21600`)
-    /// - `ACTION_RUNNER_RETIRED_REPOS` (optional comma-separated `owner/repo` list)
+    /// - `MU_CI_CONTROLLER_GITHUB_API_URL` / `ACTION_RUNNER_GITHUB_API_URL` (default `https://api.github.com`, `off` disables)
+    /// - `MU_CI_CONTROLLER_CONSOLE_METADATA_TTL_SECS` / `ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS` (default `21600`)
+    /// - `MU_CI_CONTROLLER_RETIRED_REPOS` / `ACTION_RUNNER_RETIRED_REPOS` (optional comma-separated `owner/repo` list)
     /// - reuses `GITHUB_TOKEN` from [`Config`].
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        let api = std::env::var("ACTION_RUNNER_GITHUB_API_URL")
-            .unwrap_or_else(|_| "https://api.github.com".to_string());
-        let github_api_url = if api.trim().eq_ignore_ascii_case("off") || api.trim().is_empty() {
+        let api = crate::config::first_non_empty_env(&[
+            "MU_CI_CONTROLLER_GITHUB_API_URL",
+            "ACTION_RUNNER_GITHUB_API_URL",
+        ])
+        .unwrap_or_else(|| "https://api.github.com".to_string());
+        let github_api_url = if api.eq_ignore_ascii_case("off") {
             None
         } else {
-            Some(api.trim().to_string())
+            Some(api)
         };
-        let metadata_ttl = std::env::var("ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(6 * 3600));
-        let retired_repos = std::env::var("ACTION_RUNNER_RETIRED_REPOS")
-            .map(|raw| parse_retired_repos(&raw))
-            .unwrap_or_default();
+        let metadata_ttl = crate::config::first_parsed_env::<u64>(&[
+            "MU_CI_CONTROLLER_CONSOLE_METADATA_TTL_SECS",
+            "ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS",
+        ])
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(6 * 3600));
+        let retired_repos = crate::config::first_non_empty_env(&[
+            "MU_CI_CONTROLLER_RETIRED_REPOS",
+            "ACTION_RUNNER_RETIRED_REPOS",
+        ])
+        .map(|raw| parse_retired_repos(&raw))
+        .unwrap_or_default();
         Self {
             github_api_url,
             github_token: config.github_token.clone(),
@@ -458,7 +465,10 @@ impl ConsoleState {
                 }
             }
         }
-        if let Ok(raw_env) = std::env::var("ACTION_RUNNER_RETIRED_REPOS") {
+        if let Some(raw_env) = crate::config::first_non_empty_env(&[
+            "MU_CI_CONTROLLER_RETIRED_REPOS",
+            "ACTION_RUNNER_RETIRED_REPOS",
+        ]) {
             for raw in parse_retired_repos(&raw_env) {
                 if let Some((owner, repo)) = raw.split_once('/') {
                     registry
