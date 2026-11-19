@@ -3142,7 +3142,7 @@ pub async fn create_invite(
     else {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({ "error": "ACTION_RUNNER_INVITE_SIGNING_KEY is not configured" }),
+            &json!({ "error": "MU_CI_CONTROLLER_INVITE_SIGNING_KEY (or ACTION_RUNNER_INVITE_SIGNING_KEY) is not configured" }),
         );
     };
 

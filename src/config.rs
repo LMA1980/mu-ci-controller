@@ -101,11 +101,56 @@ pub struct Config {
     pub auth_state_file: Option<PathBuf>,
 }
 
+/// Returns the first non-empty trimmed value among `vars` using a custom env lookup.
+pub(crate) fn first_non_empty_in<F>(vars: &[&str], get_env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for var in vars {
+        if let Some(val) = get_env(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parses the first valid value of `T` among `vars` using a custom env lookup.
+pub(crate) fn first_parsed_in<T, F>(vars: &[&str], get_env: &F) -> Option<T>
+where
+    T: std::str::FromStr,
+    F: Fn(&str) -> Option<String>,
+{
+    for var in vars {
+        if let Some(val) = get_env(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                if let Ok(parsed) = trimmed.parse::<T>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first non-empty trimmed value among `vars`.
+pub(crate) fn first_non_empty_env(vars: &[&str]) -> Option<String> {
+    first_non_empty_in(vars, &|k| std::env::var(k).ok())
+}
+
+/// Parses the first valid value of `T` among `vars`.
+pub(crate) fn first_parsed_env<T: std::str::FromStr>(vars: &[&str]) -> Option<T> {
+    first_parsed_in(vars, &|k| std::env::var(k).ok())
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:8000".to_string(),
-            workspace_dir: PathBuf::from(format!("/var/lib/{}-runner/workspace", "action")),
+            workspace_dir: PathBuf::from("/var/lib/mu-ci-controller/workspace"),
             allowed_repositories: vec!["LMA1980/*".to_string()],
             allowed_actors: vec!["*".to_string()],
             allow_fork_prs: false,
@@ -144,116 +189,245 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolve the default workspace directory, preferring `mu_root/workspace` unless only
+    /// `legacy_root` exists on disk.
+    #[must_use]
+    pub fn resolve_default_workspace_dir(mu_root: &Path, legacy_root: &Path) -> PathBuf {
+        if mu_root.is_dir() {
+            mu_root.join("workspace")
+        } else if legacy_root.is_dir() {
+            legacy_root.join("workspace")
+        } else {
+            mu_root.join("workspace")
+        }
+    }
+
     pub fn load() -> Self {
+        Self::load_with_env(|k| std::env::var(k).ok())
+    }
+
+    pub fn load_with_env<F>(get_env: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let bind_addr =
-            std::env::var("ACTION_RUNNER_BIND").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+            first_non_empty_in(&["MU_CI_CONTROLLER_BIND", "ACTION_RUNNER_BIND"], &get_env)
+                .unwrap_or_else(|| "127.0.0.1:8000".to_string());
 
-        let workspace_dir = std::env::var("ACTION_RUNNER_WORKSPACE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(format!("/var/lib/{}-runner/workspace", "action")));
+        let workspace_dir = first_non_empty_in(
+            &["MU_CI_CONTROLLER_WORKSPACE", "ACTION_RUNNER_WORKSPACE"],
+            &get_env,
+        )
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Self::resolve_default_workspace_dir(
+                Path::new("/var/lib/mu-ci-controller"),
+                Path::new("/var/lib/action-runner"),
+            )
+        });
 
-        let allowed_repositories = std::env::var("ACTION_RUNNER_ALLOWED_REPOS")
-            .unwrap_or_else(|_| "LMA1980/*".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let allowed_repositories = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_ALLOWED_REPOS",
+                "ACTION_RUNNER_ALLOWED_REPOS",
+            ],
+            &get_env,
+        )
+        .unwrap_or_else(|| "LMA1980/*".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-        let allowed_actors = std::env::var("ACTION_RUNNER_ALLOWED_ACTORS")
-            .unwrap_or_else(|_| "*".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let allowed_actors = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_ALLOWED_ACTORS",
+                "ACTION_RUNNER_ALLOWED_ACTORS",
+            ],
+            &get_env,
+        )
+        .unwrap_or_else(|| "*".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-        let allow_fork_prs = std::env::var("ACTION_RUNNER_ALLOW_FORK_PRS")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+        let allow_fork_prs = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_ALLOW_FORK_PRS",
+                "ACTION_RUNNER_ALLOW_FORK_PRS",
+            ],
+            &get_env,
+        )
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
 
-        let allowed_pr_authors = std::env::var("ACTION_RUNNER_ALLOWED_PR_AUTHORS")
-            .unwrap_or_else(|_| "OWNER,MEMBER,COLLABORATOR".to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let allowed_pr_authors = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_ALLOWED_PR_AUTHORS",
+                "ACTION_RUNNER_ALLOWED_PR_AUTHORS",
+            ],
+            &get_env,
+        )
+        .unwrap_or_else(|| "OWNER,MEMBER,COLLABORATOR".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-        let log_api_key = Self::resolve_secret("ACTION_RUNNER_LOG_API_KEY");
-
-        let allow_insecure_no_secret = std::env::var("ACTION_RUNNER_ALLOW_INSECURE_NO_SECRET")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
-
-        let webhook_secret = Self::resolve_secret("GITHUB_WEBHOOK_SECRET");
-        let cluster_token = Self::resolve_secret("ACTION_RUNNER_CLUSTER_TOKEN")
-            .unwrap_or_else(|| "actionrunner_default_cluster_token".to_string());
-
-        let job_timeout_seconds = std::env::var("ACTION_RUNNER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1800);
-
-        let max_concurrent_jobs = std::env::var("ACTION_RUNNER_MAX_CONCURRENT_JOBS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-
-        let github_token = Self::resolve_secret("GITHUB_TOKEN");
-
-        let node_id = std::env::var("ACTION_RUNNER_NODE_ID")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "node-a".to_string());
-
-        let ha_role = std::env::var("ACTION_RUNNER_HA_ROLE")
-            .map(|s| HaRoleConfig::parse(&s))
-            .unwrap_or(HaRoleConfig::Leader);
-
-        let lease_ttl_seconds = std::env::var("ACTION_RUNNER_LEASE_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(15);
-
-        let standby_sync_seconds = std::env::var("ACTION_RUNNER_STANDBY_SYNC_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(5);
-
-        let proxy_secret = Self::resolve_secret_with_file_var(
-            "ACTION_RUNNER_PROXY_SECRET",
-            "ACTION_RUNNER_PROXY_SECRET_FILE",
+        let log_api_key = Self::resolve_secret_first_with_env(
+            &["MU_CI_CONTROLLER_LOG_API_KEY", "ACTION_RUNNER_LOG_API_KEY"],
+            &get_env,
         );
 
-        let invite_signing_key = Self::resolve_secret_with_file_var(
-            "ACTION_RUNNER_INVITE_SIGNING_KEY",
-            "ACTION_RUNNER_INVITE_SIGNING_KEY_FILE",
+        let allow_insecure_no_secret = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_ALLOW_INSECURE_NO_SECRET",
+                "ACTION_RUNNER_ALLOW_INSECURE_NO_SECRET",
+            ],
+            &get_env,
+        )
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+
+        let webhook_secret =
+            Self::resolve_secret_first_with_env(&["GITHUB_WEBHOOK_SECRET"], &get_env);
+        let cluster_token = Self::resolve_secret_first_with_env(
+            &[
+                "MU_CI_CONTROLLER_CLUSTER_TOKEN",
+                "ACTION_RUNNER_CLUSTER_TOKEN",
+            ],
+            &get_env,
+        )
+        .unwrap_or_else(|| "actionrunner_default_cluster_token".to_string());
+
+        let job_timeout_seconds = first_parsed_in::<u64, _>(
+            &[
+                "MU_CI_CONTROLLER_TIMEOUT_SECS",
+                "ACTION_RUNNER_TIMEOUT_SECS",
+            ],
+            &get_env,
+        )
+        .unwrap_or(1800);
+
+        let max_concurrent_jobs = first_parsed_in::<usize, _>(
+            &[
+                "MU_CI_CONTROLLER_MAX_CONCURRENT_JOBS",
+                "ACTION_RUNNER_MAX_CONCURRENT_JOBS",
+            ],
+            &get_env,
+        )
+        .unwrap_or(3);
+
+        let github_token = Self::resolve_secret_first_with_env(&["GITHUB_TOKEN"], &get_env);
+
+        let node_id = first_non_empty_in(
+            &["MU_CI_CONTROLLER_NODE_ID", "ACTION_RUNNER_NODE_ID"],
+            &get_env,
+        )
+        .unwrap_or_else(|| "node-a".to_string());
+
+        let ha_role = first_non_empty_in(
+            &["MU_CI_CONTROLLER_HA_ROLE", "ACTION_RUNNER_HA_ROLE"],
+            &get_env,
+        )
+        .map(|s| HaRoleConfig::parse(&s))
+        .unwrap_or(HaRoleConfig::Leader);
+
+        let lease_ttl_seconds = first_parsed_in::<u64, _>(
+            &[
+                "MU_CI_CONTROLLER_LEASE_TTL_SECS",
+                "ACTION_RUNNER_LEASE_TTL_SECS",
+            ],
+            &get_env,
+        )
+        .filter(|&v| v > 0)
+        .unwrap_or(15);
+
+        let standby_sync_seconds = first_parsed_in::<u64, _>(
+            &[
+                "MU_CI_CONTROLLER_STANDBY_SYNC_SECS",
+                "ACTION_RUNNER_STANDBY_SYNC_SECS",
+            ],
+            &get_env,
+        )
+        .filter(|&v| v > 0)
+        .unwrap_or(5);
+
+        let proxy_secret = Self::resolve_secret_pairs_with_env(
+            &[
+                (
+                    "MU_CI_CONTROLLER_PROXY_SECRET",
+                    "MU_CI_CONTROLLER_PROXY_SECRET_FILE",
+                ),
+                (
+                    "ACTION_RUNNER_PROXY_SECRET",
+                    "ACTION_RUNNER_PROXY_SECRET_FILE",
+                ),
+            ],
+            &get_env,
         );
 
-        let bootstrap_admins = std::env::var("ACTION_RUNNER_BOOTSTRAP_ADMINS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let invite_signing_key = Self::resolve_secret_pairs_with_env(
+            &[
+                (
+                    "MU_CI_CONTROLLER_INVITE_SIGNING_KEY",
+                    "MU_CI_CONTROLLER_INVITE_SIGNING_KEY_FILE",
+                ),
+                (
+                    "ACTION_RUNNER_INVITE_SIGNING_KEY",
+                    "ACTION_RUNNER_INVITE_SIGNING_KEY_FILE",
+                ),
+            ],
+            &get_env,
+        );
 
-        let quic_bind_addr = std::env::var("ACTION_RUNNER_QUIC_BIND").ok();
-        let quic_alt_svc_port = std::env::var("ACTION_RUNNER_QUIC_ALT_SVC_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let quic_alt_svc_max_age = std::env::var("ACTION_RUNNER_QUIC_ALT_SVC_MAX_AGE")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let tls_cert_path = std::env::var("ACTION_RUNNER_TLS_CERT")
-            .ok()
-            .map(PathBuf::from);
-        let tls_key_path = std::env::var("ACTION_RUNNER_TLS_KEY")
-            .ok()
-            .map(PathBuf::from);
-        let tls_ca_path = std::env::var("ACTION_RUNNER_TLS_CA")
-            .ok()
-            .map(PathBuf::from);
+        let bootstrap_admins = first_non_empty_in(
+            &[
+                "MU_CI_CONTROLLER_BOOTSTRAP_ADMINS",
+                "ACTION_RUNNER_BOOTSTRAP_ADMINS",
+            ],
+            &get_env,
+        )
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+        let quic_bind_addr = first_non_empty_in(
+            &["MU_CI_CONTROLLER_QUIC_BIND", "ACTION_RUNNER_QUIC_BIND"],
+            &get_env,
+        );
+        let quic_alt_svc_port = first_parsed_in::<u16, _>(
+            &[
+                "MU_CI_CONTROLLER_QUIC_ALT_SVC_PORT",
+                "ACTION_RUNNER_QUIC_ALT_SVC_PORT",
+            ],
+            &get_env,
+        );
+        let quic_alt_svc_max_age = first_parsed_in::<u64, _>(
+            &[
+                "MU_CI_CONTROLLER_QUIC_ALT_SVC_MAX_AGE",
+                "ACTION_RUNNER_QUIC_ALT_SVC_MAX_AGE",
+            ],
+            &get_env,
+        );
+        let tls_cert_path = first_non_empty_in(
+            &["MU_CI_CONTROLLER_TLS_CERT", "ACTION_RUNNER_TLS_CERT"],
+            &get_env,
+        )
+        .map(PathBuf::from);
+        let tls_key_path = first_non_empty_in(
+            &["MU_CI_CONTROLLER_TLS_KEY", "ACTION_RUNNER_TLS_KEY"],
+            &get_env,
+        )
+        .map(PathBuf::from);
+        let tls_ca_path = first_non_empty_in(
+            &["MU_CI_CONTROLLER_TLS_CA", "ACTION_RUNNER_TLS_CA"],
+            &get_env,
+        )
+        .map(PathBuf::from);
 
         Self {
             bind_addr,
@@ -282,36 +456,58 @@ impl Config {
             tls_cert_path,
             tls_key_path,
             tls_ca_path,
-            webauthn_rp_id: std::env::var("ACTION_RUNNER_WEBAUTHN_RP_ID")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "localhost".to_string()),
-            webauthn_rp_name: std::env::var("ACTION_RUNNER_WEBAUTHN_RP_NAME")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "MuConsole Platform".to_string()),
-            webauthn_rp_origin: std::env::var("ACTION_RUNNER_WEBAUTHN_ORIGIN")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "http://localhost".to_string()),
-            host_elevation_secret: Self::resolve_secret_with_file_var(
-                "ACTION_RUNNER_HOST_ELEVATION_SECRET",
-                "ACTION_RUNNER_HOST_ELEVATION_SECRET_FILE",
+            webauthn_rp_id: first_non_empty_in(
+                &[
+                    "MU_CI_CONTROLLER_WEBAUTHN_RP_ID",
+                    "ACTION_RUNNER_WEBAUTHN_RP_ID",
+                ],
+                &get_env,
+            )
+            .unwrap_or_else(|| "localhost".to_string()),
+            webauthn_rp_name: first_non_empty_in(
+                &[
+                    "MU_CI_CONTROLLER_WEBAUTHN_RP_NAME",
+                    "ACTION_RUNNER_WEBAUTHN_RP_NAME",
+                ],
+                &get_env,
+            )
+            .unwrap_or_else(|| "MuConsole Platform".to_string()),
+            webauthn_rp_origin: first_non_empty_in(
+                &[
+                    "MU_CI_CONTROLLER_WEBAUTHN_ORIGIN",
+                    "ACTION_RUNNER_WEBAUTHN_ORIGIN",
+                ],
+                &get_env,
+            )
+            .unwrap_or_else(|| "http://localhost".to_string()),
+            host_elevation_secret: Self::resolve_secret_pairs_with_env(
+                &[
+                    (
+                        "MU_CI_CONTROLLER_HOST_ELEVATION_SECRET",
+                        "MU_CI_CONTROLLER_HOST_ELEVATION_SECRET_FILE",
+                    ),
+                    (
+                        "ACTION_RUNNER_HOST_ELEVATION_SECRET",
+                        "ACTION_RUNNER_HOST_ELEVATION_SECRET_FILE",
+                    ),
+                ],
+                &get_env,
             ),
-            auth_state_file: std::env::var("ACTION_RUNNER_AUTH_STATE_FILE")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            auth_state_file: first_non_empty_in(
+                &[
+                    "MU_CI_CONTROLLER_AUTH_STATE_FILE",
+                    "ACTION_RUNNER_AUTH_STATE_FILE",
+                ],
+                &get_env,
+            )
+            .map(PathBuf::from),
         }
     }
 
     /// Returns the HMAC secret used to sign `__Host-mu_elevated` session cookies.
-    /// Prefers `ACTION_RUNNER_HOST_ELEVATION_SECRET`, falls back to `invite_signing_key`,
-    /// or generates an ephemeral per-process secret if neither is configured.
+    /// Prefers `MU_CI_CONTROLLER_HOST_ELEVATION_SECRET` (or `ACTION_RUNNER_HOST_ELEVATION_SECRET`),
+    /// falls back to `invite_signing_key`, or generates an ephemeral per-process secret if neither
+    /// is configured.
     #[must_use]
     pub fn elevation_signing_key(&self) -> String {
         static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -368,14 +564,55 @@ impl Config {
         Self::resolve_secret_value(&val)
     }
 
-    pub fn resolve_secret_with_file_var(env_var: &str, file_env_var: &str) -> Option<String> {
-        if let Ok(file_val) = std::env::var(file_env_var) {
-            let trimmed = file_val.trim();
-            if !trimmed.is_empty() {
-                return Self::resolve_secret_file(trimmed);
+    /// Resolve a secret from the first non-empty environment variable in `vars`.
+    /// Fails closed (`None`) if the selected variable points to an unreadable or empty path.
+    pub fn resolve_secret_first(vars: &[&str]) -> Option<String> {
+        Self::resolve_secret_first_with_env(vars, |k| std::env::var(k).ok())
+    }
+
+    pub fn resolve_secret_first_with_env<F>(vars: &[&str], get_env: F) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for var in vars {
+            if let Some(val) = get_env(var) {
+                if !val.trim().is_empty() {
+                    return Self::resolve_secret_value(&val);
+                }
             }
         }
-        Self::resolve_secret(env_var)
+        None
+    }
+
+    pub fn resolve_secret_with_file_var(env_var: &str, file_env_var: &str) -> Option<String> {
+        Self::resolve_secret_pairs(&[(env_var, file_env_var)])
+    }
+
+    /// Resolve a secret across ordered `(value_var, file_var)` pairs.
+    /// Commits to the first pair with a non-empty variable and fails closed if a configured file
+    /// path cannot be read.
+    pub fn resolve_secret_pairs(pairs: &[(&str, &str)]) -> Option<String> {
+        Self::resolve_secret_pairs_with_env(pairs, |k| std::env::var(k).ok())
+    }
+
+    pub fn resolve_secret_pairs_with_env<F>(pairs: &[(&str, &str)], get_env: F) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for (env_var, file_env_var) in pairs {
+            if let Some(file_val) = get_env(file_env_var) {
+                let trimmed = file_val.trim();
+                if !trimmed.is_empty() {
+                    return Self::resolve_secret_file(trimmed);
+                }
+            }
+            if let Some(val) = get_env(env_var) {
+                if !val.trim().is_empty() {
+                    return Self::resolve_secret_value(&val);
+                }
+            }
+        }
+        None
     }
 
     pub fn resolve_secret_file(path_str: &str) -> Option<String> {
@@ -594,5 +831,314 @@ mod tests {
             Some("fallback-literal".to_string())
         );
         std::env::remove_var(env_lit);
+    }
+
+    static CONTROLLER_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| ((*k).to_string(), std::env::var_os(k)))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_default_workspace_dir_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mu_root = dir.path().join("mu-ci-controller");
+        let legacy_root = dir.path().join("action-runner");
+
+        // Neither exists -> canonical mu_root/workspace
+        assert_eq!(
+            Config::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            mu_root.join("workspace")
+        );
+
+        // Only legacy exists -> legacy_root/workspace
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        assert_eq!(
+            Config::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            legacy_root.join("workspace")
+        );
+
+        // Both exist -> canonical mu_root/workspace
+        std::fs::create_dir_all(&mu_root).unwrap();
+        assert_eq!(
+            Config::resolve_default_workspace_dir(&mu_root, &legacy_root),
+            mu_root.join("workspace")
+        );
+    }
+
+    #[test]
+    fn test_controller_config_load_mu_ci_controller_precedence_and_fallback() {
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+
+        // 1. Legacy ACTION_RUNNER_* fallback when MU_CI_CONTROLLER_* unset
+        env_map.insert("ACTION_RUNNER_BIND", "127.0.0.1:9100".to_string());
+        env_map.insert("ACTION_RUNNER_WORKSPACE", "/tmp/legacy-ctrl-ws".to_string());
+        env_map.insert("ACTION_RUNNER_ALLOWED_REPOS", "org/legacy".to_string());
+        env_map.insert("ACTION_RUNNER_ALLOWED_ACTORS", "alice".to_string());
+        env_map.insert("ACTION_RUNNER_ALLOW_FORK_PRS", "true".to_string());
+        env_map.insert("ACTION_RUNNER_ALLOWED_PR_AUTHORS", "OWNER".to_string());
+        env_map.insert("ACTION_RUNNER_LOG_API_KEY", "legacy-log-key".to_string());
+        env_map.insert("ACTION_RUNNER_ALLOW_INSECURE_NO_SECRET", "1".to_string());
+        env_map.insert(
+            "ACTION_RUNNER_CLUSTER_TOKEN",
+            "legacy-cluster-tok".to_string(),
+        );
+        env_map.insert("ACTION_RUNNER_TIMEOUT_SECS", "900".to_string());
+        env_map.insert("ACTION_RUNNER_MAX_CONCURRENT_JOBS", "5".to_string());
+        env_map.insert("ACTION_RUNNER_NODE_ID", "node-legacy".to_string());
+        env_map.insert("ACTION_RUNNER_HA_ROLE", "standby".to_string());
+        env_map.insert("ACTION_RUNNER_LEASE_TTL_SECS", "25".to_string());
+        env_map.insert("ACTION_RUNNER_STANDBY_SYNC_SECS", "9".to_string());
+        env_map.insert("ACTION_RUNNER_PROXY_SECRET", "legacy-proxy".to_string());
+        env_map.insert(
+            "ACTION_RUNNER_INVITE_SIGNING_KEY",
+            "legacy-invite".to_string(),
+        );
+        env_map.insert("ACTION_RUNNER_BOOTSTRAP_ADMINS", "admin1".to_string());
+        env_map.insert("ACTION_RUNNER_QUIC_BIND", "127.0.0.1:9443".to_string());
+        env_map.insert("ACTION_RUNNER_QUIC_ALT_SVC_PORT", "9443".to_string());
+        env_map.insert("ACTION_RUNNER_QUIC_ALT_SVC_MAX_AGE", "120".to_string());
+        env_map.insert("ACTION_RUNNER_TLS_CERT", "/tmp/legacy.crt".to_string());
+        env_map.insert("ACTION_RUNNER_TLS_KEY", "/tmp/legacy.key".to_string());
+        env_map.insert("ACTION_RUNNER_TLS_CA", "/tmp/legacy-ca.crt".to_string());
+        env_map.insert(
+            "ACTION_RUNNER_WEBAUTHN_RP_ID",
+            "legacy.example.org".to_string(),
+        );
+        env_map.insert("ACTION_RUNNER_WEBAUTHN_RP_NAME", "Legacy".to_string());
+        env_map.insert(
+            "ACTION_RUNNER_WEBAUTHN_ORIGIN",
+            "https://legacy.example.org".to_string(),
+        );
+        env_map.insert(
+            "ACTION_RUNNER_HOST_ELEVATION_SECRET",
+            "legacy-elev".to_string(),
+        );
+        env_map.insert(
+            "ACTION_RUNNER_AUTH_STATE_FILE",
+            "/tmp/legacy-auth.json".to_string(),
+        );
+
+        let legacy_cfg = Config::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(legacy_cfg.bind_addr, "127.0.0.1:9100");
+        assert_eq!(
+            legacy_cfg.workspace_dir,
+            PathBuf::from("/tmp/legacy-ctrl-ws")
+        );
+        assert_eq!(legacy_cfg.allowed_repositories, vec!["org/legacy"]);
+        assert_eq!(legacy_cfg.allowed_actors, vec!["alice"]);
+        assert!(legacy_cfg.allow_fork_prs);
+        assert_eq!(legacy_cfg.allowed_pr_authors, vec!["OWNER"]);
+        assert_eq!(legacy_cfg.log_api_key.as_deref(), Some("legacy-log-key"));
+        assert!(legacy_cfg.allow_insecure_no_secret);
+        assert_eq!(legacy_cfg.cluster_token, "legacy-cluster-tok");
+        assert_eq!(legacy_cfg.job_timeout_seconds, 900);
+        assert_eq!(legacy_cfg.max_concurrent_jobs, 5);
+        assert_eq!(legacy_cfg.node_id, "node-legacy");
+        assert_eq!(legacy_cfg.ha_role, HaRoleConfig::Standby);
+        assert_eq!(legacy_cfg.lease_ttl_seconds, 25);
+        assert_eq!(legacy_cfg.standby_sync_seconds, 9);
+        assert_eq!(legacy_cfg.proxy_secret.as_deref(), Some("legacy-proxy"));
+        assert_eq!(
+            legacy_cfg.invite_signing_key.as_deref(),
+            Some("legacy-invite")
+        );
+        assert_eq!(legacy_cfg.bootstrap_admins, vec!["admin1"]);
+        assert_eq!(legacy_cfg.quic_bind_addr.as_deref(), Some("127.0.0.1:9443"));
+        assert_eq!(legacy_cfg.quic_alt_svc_port, Some(9443));
+        assert_eq!(legacy_cfg.quic_alt_svc_max_age, Some(120));
+        assert_eq!(
+            legacy_cfg.tls_cert_path,
+            Some(PathBuf::from("/tmp/legacy.crt"))
+        );
+        assert_eq!(
+            legacy_cfg.tls_key_path,
+            Some(PathBuf::from("/tmp/legacy.key"))
+        );
+        assert_eq!(
+            legacy_cfg.tls_ca_path,
+            Some(PathBuf::from("/tmp/legacy-ca.crt"))
+        );
+        assert_eq!(legacy_cfg.webauthn_rp_id, "legacy.example.org");
+        assert_eq!(legacy_cfg.webauthn_rp_name, "Legacy");
+        assert_eq!(legacy_cfg.webauthn_rp_origin, "https://legacy.example.org");
+        assert_eq!(
+            legacy_cfg.host_elevation_secret.as_deref(),
+            Some("legacy-elev")
+        );
+        assert_eq!(
+            legacy_cfg.auth_state_file,
+            Some(PathBuf::from("/tmp/legacy-auth.json"))
+        );
+
+        // 2. Canonical MU_CI_CONTROLLER_* values override ACTION_RUNNER_*
+        let dir = tempfile::tempdir().unwrap();
+        let elev_file = dir.path().join("elev.secret");
+        std::fs::write(&elev_file, "canonical-elev-from-file\n").unwrap();
+
+        env_map.insert("MU_CI_CONTROLLER_BIND", "0.0.0.0:8080".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_WORKSPACE",
+            "/tmp/canonical-ctrl-ws".to_string(),
+        );
+        env_map.insert("MU_CI_CONTROLLER_ALLOWED_REPOS", "LMA1980/*".to_string());
+        env_map.insert("MU_CI_CONTROLLER_ALLOWED_ACTORS", "bob".to_string());
+        env_map.insert("MU_CI_CONTROLLER_ALLOW_FORK_PRS", "false".to_string());
+        env_map.insert("MU_CI_CONTROLLER_ALLOWED_PR_AUTHORS", "MEMBER".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_LOG_API_KEY",
+            "canonical-log-key".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_ALLOW_INSECURE_NO_SECRET",
+            "false".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_CLUSTER_TOKEN",
+            "canonical-cluster-tok".to_string(),
+        );
+        env_map.insert("MU_CI_CONTROLLER_TIMEOUT_SECS", "1200".to_string());
+        env_map.insert("MU_CI_CONTROLLER_MAX_CONCURRENT_JOBS", "8".to_string());
+        env_map.insert("MU_CI_CONTROLLER_NODE_ID", "node-b".to_string());
+        env_map.insert("MU_CI_CONTROLLER_HA_ROLE", "auto".to_string());
+        env_map.insert("MU_CI_CONTROLLER_LEASE_TTL_SECS", "30".to_string());
+        env_map.insert("MU_CI_CONTROLLER_STANDBY_SYNC_SECS", "12".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_PROXY_SECRET",
+            "canonical-proxy".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_INVITE_SIGNING_KEY",
+            "canonical-invite".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_BOOTSTRAP_ADMINS",
+            "admin2,admin3".to_string(),
+        );
+        env_map.insert("MU_CI_CONTROLLER_QUIC_BIND", "0.0.0.0:8443".to_string());
+        env_map.insert("MU_CI_CONTROLLER_QUIC_ALT_SVC_PORT", "8443".to_string());
+        env_map.insert("MU_CI_CONTROLLER_QUIC_ALT_SVC_MAX_AGE", "300".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_TLS_CERT",
+            "/tmp/canonical.crt".to_string(),
+        );
+        env_map.insert("MU_CI_CONTROLLER_TLS_KEY", "/tmp/canonical.key".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_TLS_CA",
+            "/tmp/canonical-ca.crt".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_WEBAUTHN_RP_ID",
+            "mu.example.org".to_string(),
+        );
+        env_map.insert("MU_CI_CONTROLLER_WEBAUTHN_RP_NAME", "MuCI".to_string());
+        env_map.insert(
+            "MU_CI_CONTROLLER_WEBAUTHN_ORIGIN",
+            "https://mu.example.org".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_HOST_ELEVATION_SECRET_FILE",
+            elev_file.to_str().unwrap().to_string(),
+        );
+        env_map.insert(
+            "MU_CI_CONTROLLER_AUTH_STATE_FILE",
+            "/tmp/canonical-auth.json".to_string(),
+        );
+
+        let mu_cfg = Config::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(mu_cfg.bind_addr, "0.0.0.0:8080");
+        assert_eq!(
+            mu_cfg.workspace_dir,
+            PathBuf::from("/tmp/canonical-ctrl-ws")
+        );
+        assert_eq!(mu_cfg.allowed_repositories, vec!["LMA1980/*"]);
+        assert_eq!(mu_cfg.allowed_actors, vec!["bob"]);
+        assert!(!mu_cfg.allow_fork_prs);
+        assert_eq!(mu_cfg.allowed_pr_authors, vec!["MEMBER"]);
+        assert_eq!(mu_cfg.log_api_key.as_deref(), Some("canonical-log-key"));
+        assert!(!mu_cfg.allow_insecure_no_secret);
+        assert_eq!(mu_cfg.cluster_token, "canonical-cluster-tok");
+        assert_eq!(mu_cfg.job_timeout_seconds, 1200);
+        assert_eq!(mu_cfg.max_concurrent_jobs, 8);
+        assert_eq!(mu_cfg.node_id, "node-b");
+        assert_eq!(mu_cfg.ha_role, HaRoleConfig::Auto);
+        assert_eq!(mu_cfg.lease_ttl_seconds, 30);
+        assert_eq!(mu_cfg.standby_sync_seconds, 12);
+        assert_eq!(mu_cfg.proxy_secret.as_deref(), Some("canonical-proxy"));
+        assert_eq!(
+            mu_cfg.invite_signing_key.as_deref(),
+            Some("canonical-invite")
+        );
+        assert_eq!(mu_cfg.bootstrap_admins, vec!["admin2", "admin3"]);
+        assert_eq!(mu_cfg.quic_bind_addr.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(mu_cfg.quic_alt_svc_port, Some(8443));
+        assert_eq!(mu_cfg.quic_alt_svc_max_age, Some(300));
+        assert_eq!(
+            mu_cfg.tls_cert_path,
+            Some(PathBuf::from("/tmp/canonical.crt"))
+        );
+        assert_eq!(
+            mu_cfg.tls_key_path,
+            Some(PathBuf::from("/tmp/canonical.key"))
+        );
+        assert_eq!(
+            mu_cfg.tls_ca_path,
+            Some(PathBuf::from("/tmp/canonical-ca.crt"))
+        );
+        assert_eq!(mu_cfg.webauthn_rp_id, "mu.example.org");
+        assert_eq!(mu_cfg.webauthn_rp_name, "MuCI");
+        assert_eq!(mu_cfg.webauthn_rp_origin, "https://mu.example.org");
+        assert_eq!(
+            mu_cfg.host_elevation_secret.as_deref(),
+            Some("canonical-elev-from-file")
+        );
+        assert_eq!(
+            mu_cfg.auth_state_file,
+            Some(PathBuf::from("/tmp/canonical-auth.json"))
+        );
+
+        // 3. Unreadable canonical secret file fails closed instead of falling back to legacy secret
+        env_map.insert(
+            "MU_CI_CONTROLLER_PROXY_SECRET_FILE",
+            "/nonexistent/canonical-proxy.secret".to_string(),
+        );
+        let fail_closed_cfg = Config::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(fail_closed_cfg.proxy_secret, None);
+
+        // 4. Verify process env helpers using unique test-only keys
+        let _lock = CONTROLLER_ENV_TEST_LOCK.lock().unwrap();
+        let test_keys = [
+            "TEST_MU_CI_CONTROLLER_ENV_PRIMARY",
+            "TEST_ACTION_RUNNER_ENV_FALLBACK",
+        ];
+        let _guard = EnvGuard::capture(&test_keys);
+        std::env::remove_var(test_keys[0]);
+        std::env::set_var(test_keys[1], "77");
+        assert_eq!(first_non_empty_env(&test_keys).as_deref(), Some("77"));
+        assert_eq!(first_parsed_env::<usize>(&test_keys), Some(77));
+        std::env::set_var(test_keys[0], "88");
+        assert_eq!(first_non_empty_env(&test_keys).as_deref(), Some("88"));
+        assert_eq!(first_parsed_env::<usize>(&test_keys), Some(88));
     }
 }

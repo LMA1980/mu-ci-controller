@@ -2383,7 +2383,7 @@ mod post_ci_cd {
         })
     }
 
-    fn canonical_public_binary_candidates(name: &str) -> &'static [&'static str] {
+    pub(crate) fn canonical_public_binary_candidates(name: &str) -> &'static [&'static str] {
         let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
             "action-runner" | "action-runner-worker" | "mu-ci-worker" => {
@@ -2403,10 +2403,14 @@ mod post_ci_cd {
             "muobserve-collector" | "mu-observable-collector" => {
                 &["mu-observable-collector", "muobserve-collector"]
             }
-            "muobserve-sentinel" | "mu-observable-sentinel" => {
-                &["mu-observable-sentinel", "muobserve-sentinel"]
+            "musentinel" | "muobserve-sentinel" | "mu-observable-sentinel" => {
+                &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
             }
-            "k3-manager" | "jero-manager" => &["k3-manager", "jero-manager"],
+            "jero-engine" | "jero-worker" | "k3-worker" => {
+                &["jero-engine", "jero-worker", "k3-worker"]
+            }
+            "jero-kv-cache" | "k3-kv" => &["jero-kv-cache", "k3-kv"],
+            "jero-manager" | "k3-manager" => &["jero-manager", "k3-manager"],
             _ => &[],
         }
     }
@@ -2418,7 +2422,10 @@ mod post_ci_cd {
         }
     }
 
-    fn candidate_binary_names(summary: &CdManifestSummary, repo_name: &str) -> Vec<String> {
+    pub(crate) fn candidate_binary_names(
+        summary: &CdManifestSummary,
+        repo_name: &str,
+    ) -> Vec<String> {
         let mut names = Vec::new();
         if let Some(bin) = summary.binary.as_deref() {
             push_unique_name(&mut names, bin);
@@ -2869,11 +2876,26 @@ pub async fn trigger_post_ci_cd_pipeline(job: &Job, repo_workspace: &Path) -> bo
             return false;
         }
     };
-    let muregist_san =
-        first_non_empty_env(&["MUREGIST_CLIENT_CERT_SAN", "ACTION_RUNNER_CLIENT_CERT_SAN"]);
-    let tls_ca_path = first_non_empty_env(&["MUREGIST_TLS_CA", "ACTION_RUNNER_TLS_CA"]);
-    let tls_cert_path = first_non_empty_env(&["MUREGIST_TLS_CERT", "ACTION_RUNNER_TLS_CERT"]);
-    let tls_key_path = first_non_empty_env(&["MUREGIST_TLS_KEY", "ACTION_RUNNER_TLS_KEY"]);
+    let muregist_san = first_non_empty_env(&[
+        "MUREGIST_CLIENT_CERT_SAN",
+        "MU_CI_CONTROLLER_CLIENT_CERT_SAN",
+        "ACTION_RUNNER_CLIENT_CERT_SAN",
+    ]);
+    let tls_ca_path = first_non_empty_env(&[
+        "MUREGIST_TLS_CA",
+        "MU_CI_CONTROLLER_TLS_CA",
+        "ACTION_RUNNER_TLS_CA",
+    ]);
+    let tls_cert_path = first_non_empty_env(&[
+        "MUREGIST_TLS_CERT",
+        "MU_CI_CONTROLLER_TLS_CERT",
+        "ACTION_RUNNER_TLS_CERT",
+    ]);
+    let tls_key_path = first_non_empty_env(&[
+        "MUREGIST_TLS_KEY",
+        "MU_CI_CONTROLLER_TLS_KEY",
+        "ACTION_RUNNER_TLS_KEY",
+    ]);
     let muconde_url = first_non_empty_env(&["MUCONDE_CD_API_URL"]);
     let cd_token = load_cd_api_token();
 
@@ -4576,5 +4598,103 @@ on_action:
                 serde_json::from_str(&s_infra.attributes_json).unwrap();
             assert_eq!(a_infra["ci.outcome"], "infra_failure");
         }
+    }
+
+    #[test]
+    fn test_canonical_public_binary_candidates_resolution() {
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("jero-engine"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("jero-worker"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("k3-worker"),
+            &["jero-engine", "jero-worker", "k3-worker"]
+        );
+
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("jero-kv-cache"),
+            &["jero-kv-cache", "k3-kv"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("k3-kv"),
+            &["jero-kv-cache", "k3-kv"]
+        );
+
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("jero-manager"),
+            &["jero-manager", "k3-manager"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("k3-manager"),
+            &["jero-manager", "k3-manager"]
+        );
+
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("mu-observable-sentinel"),
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("musentinel"),
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        );
+        assert_eq!(
+            post_ci_cd::canonical_public_binary_candidates("muobserve-sentinel"),
+            &["mu-observable-sentinel", "musentinel", "muobserve-sentinel"]
+        );
+
+        // Verify candidate_binary_names puts canonical public binary first when legacy service name is used
+        let summary_mgr = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"k3-manager\"\n",
+            "LMA1980/jero-manager",
+        );
+        let mgr_candidates =
+            post_ci_cd::candidate_binary_names(&summary_mgr, "LMA1980/jero-manager");
+        assert_eq!(
+            mgr_candidates.first().map(String::as_str),
+            Some("jero-manager")
+        );
+        assert!(mgr_candidates.contains(&"k3-manager".to_string()));
+
+        let summary_engine = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"k3-worker\"\n",
+            "LMA1980/jero-engine",
+        );
+        let engine_candidates =
+            post_ci_cd::candidate_binary_names(&summary_engine, "LMA1980/jero-engine");
+        assert_eq!(
+            engine_candidates.first().map(String::as_str),
+            Some("jero-engine")
+        );
+        assert!(engine_candidates.contains(&"jero-worker".to_string()));
+        assert!(engine_candidates.contains(&"k3-worker".to_string()));
+
+        let summary_kv = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"k3-kv\"\n",
+            "LMA1980/jero-kv-cache",
+        );
+        let kv_candidates =
+            post_ci_cd::candidate_binary_names(&summary_kv, "LMA1980/jero-kv-cache");
+        assert_eq!(
+            kv_candidates.first().map(String::as_str),
+            Some("jero-kv-cache")
+        );
+        assert!(kv_candidates.contains(&"k3-kv".to_string()));
+
+        let summary_sentinel = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"musentinel\"\n",
+            "LMA1980/mu-observable-sentinel",
+        );
+        let sentinel_candidates =
+            post_ci_cd::candidate_binary_names(&summary_sentinel, "LMA1980/mu-observable-sentinel");
+        assert_eq!(
+            sentinel_candidates.first().map(String::as_str),
+            Some("mu-observable-sentinel")
+        );
+        assert!(sentinel_candidates.contains(&"musentinel".to_string()));
+        assert!(sentinel_candidates.contains(&"muobserve-sentinel".to_string()));
     }
 }

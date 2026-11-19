@@ -1,0 +1,28 @@
+[Unit]
+Description=Mu-CI Distributed Cluster Controller & WebAPI
+Documentation=https://github.com/LMA1980/mu-ci-controller
+After=network.target
+
+[Service]
+Type=simple
+User=mu-ci-controller
+Group=mu-ci-controller
+WorkingDirectory=/var/lib/mu-ci-controller
+EnvironmentFile=/etc/mu-ci-controller/controller.env
+ExecStart=/usr/local/bin/mu-ci-controller
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-ci-controller
+InaccessiblePaths=/etc/shadow /root
+
+[Install]
+WantedBy=multi-user.target

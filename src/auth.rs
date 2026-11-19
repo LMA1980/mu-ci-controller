@@ -1437,16 +1437,18 @@ pub fn execute_reset_passkeys_cli(args: &[String]) -> Option<Result<String, Stri
         return None;
     };
 
-    let mut workspace_dir: Option<PathBuf> = std::env::var("ACTION_RUNNER_WORKSPACE_DIR")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let mut explicit_file: Option<PathBuf> = std::env::var("ACTION_RUNNER_AUTH_STATE_FILE")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    let mut workspace_dir: Option<PathBuf> = crate::config::first_non_empty_env(&[
+        "MU_CI_CONTROLLER_WORKSPACE_DIR",
+        "MU_CI_CONTROLLER_WORKSPACE",
+        "ACTION_RUNNER_WORKSPACE_DIR",
+        "ACTION_RUNNER_WORKSPACE",
+    ])
+    .map(PathBuf::from);
+    let mut explicit_file: Option<PathBuf> = crate::config::first_non_empty_env(&[
+        "MU_CI_CONTROLLER_AUTH_STATE_FILE",
+        "ACTION_RUNNER_AUTH_STATE_FILE",
+    ])
+    .map(PathBuf::from);
 
     let mut i = target_idx;
     while i < tail.len() {
