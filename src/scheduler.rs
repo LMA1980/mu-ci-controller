@@ -1922,18 +1922,22 @@ pub struct PostCiCdEndpointConfig<'a> {
 mod post_ci_cd {
     use super::extract_cd_service_name;
     use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::io::Write;
     use std::path::{Component, Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tar::{Archive, Builder, EntryType, Header};
+
+    pub(super) const MAX_IT_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
     #[derive(Debug, Default, Deserialize)]
     struct RawCdManifest {
         #[serde(default)]
         target_nodes: Vec<String>,
+        #[serde(default)]
+        integration_tests: Option<serde_yaml::Value>,
         #[serde(default)]
         deployment: RawCdDeployment,
     }
@@ -1956,6 +1960,7 @@ mod post_ci_cd {
         pub(super) web_root: Option<String>,
         pub(super) artifact: Option<String>,
         pub(super) target_nodes: Vec<String>,
+        pub(super) integration_tests: Vec<String>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1966,7 +1971,7 @@ mod post_ci_cd {
     }
 
     impl ExpectedElfArch {
-        const fn e_machine(self) -> u16 {
+        pub(super) const fn e_machine(self) -> u16 {
             match self {
                 Self::X86_64 => 0x003E,
                 Self::Riscv64 => 0x00F3,
@@ -1974,7 +1979,16 @@ mod post_ci_cd {
             }
         }
 
-        const fn label(self) -> &'static str {
+        pub(super) const fn from_e_machine(e_machine: u16) -> Option<Self> {
+            match e_machine {
+                0x003E => Some(Self::X86_64),
+                0x00F3 => Some(Self::Riscv64),
+                0x00B7 => Some(Self::Aarch64),
+                _ => None,
+            }
+        }
+
+        pub(super) const fn label(self) -> &'static str {
             match self {
                 Self::X86_64 => "x86_64",
                 Self::Riscv64 => "riscv64",
@@ -1982,7 +1996,7 @@ mod post_ci_cd {
             }
         }
 
-        const fn target_triple(self) -> &'static str {
+        pub(super) const fn target_triple(self) -> &'static str {
             match self {
                 Self::X86_64 => "x86_64-unknown-linux-gnu",
                 Self::Riscv64 => "riscv64gc-unknown-linux-gnu",
@@ -2017,6 +2031,25 @@ mod post_ci_cd {
         })
     }
 
+    fn parse_integration_tests(val: Option<serde_yaml::Value>) -> Vec<String> {
+        match val {
+            Some(serde_yaml::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![trimmed.to_string()]
+                }
+            }
+            Some(serde_yaml::Value::Sequence(items)) => items
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::trim).map(ToOwned::to_owned))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub(super) fn parse_cd_manifest_summary(
         manifest_yaml: &str,
         repo_name: &str,
@@ -2028,6 +2061,7 @@ mod post_ci_cd {
         } else {
             parsed.target_nodes
         };
+        let integration_tests = parse_integration_tests(parsed.integration_tests);
         CdManifestSummary {
             service_name,
             binary: clean_opt(parsed.deployment.binary),
@@ -2035,6 +2069,7 @@ mod post_ci_cd {
             web_root: clean_opt(parsed.deployment.web_root),
             artifact: clean_opt(parsed.deployment.artifact),
             target_nodes,
+            integration_tests,
         }
     }
 
@@ -2088,20 +2123,26 @@ mod post_ci_cd {
         expected: Option<ExpectedElfArch>,
         artifact_path: &Path,
     ) -> Result<(), String> {
-        let Some(arch) = expected else {
-            return Ok(());
-        };
         let Some((ei_class, e_machine)) = parse_elf_machine(bytes) else {
             return Ok(());
         };
-        if ei_class != 2 || e_machine != arch.e_machine() {
+        if ei_class != 2 {
             return Err(format!(
-                "Artifact '{}' ELF target (class={}, e_machine=0x{e_machine:04x}) does not match target_nodes architecture {} (0x{:04x})",
+                "Artifact '{}' is not a 64-bit ELF binary (EI_CLASS={}, expected 2)",
                 artifact_path.display(),
-                ei_class,
-                arch.label(),
-                arch.e_machine()
+                ei_class
             ));
+        }
+        if let Some(arch) = expected {
+            if e_machine != arch.e_machine() {
+                return Err(format!(
+                    "Artifact '{}' ELF target (class={}, e_machine=0x{e_machine:04x}) does not match target_nodes architecture {} (0x{:04x})",
+                    artifact_path.display(),
+                    ei_class,
+                    arch.label(),
+                    arch.e_machine()
+                ));
+            }
         }
         Ok(())
     }
@@ -2577,40 +2618,635 @@ mod post_ci_cd {
         }
     }
 
+    const fn default_it_critical() -> bool {
+        true
+    }
+
+    const fn default_it_schema_version() -> u32 {
+        1
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub(super) struct ItManifestEntryJson {
+        pub(super) name: String,
+        pub(super) command: String,
+        #[serde(default)]
+        pub(super) args: Vec<String>,
+        #[serde(default = "default_it_critical")]
+        pub(super) critical: bool,
+        #[serde(default)]
+        pub(super) timeout_secs: Option<u64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub(super) struct ItManifestJson {
+        #[serde(default = "default_it_schema_version")]
+        pub(super) schema_version: u32,
+        #[serde(default)]
+        pub(super) service: String,
+        #[serde(default)]
+        pub(super) git_commit: String,
+        #[serde(default)]
+        pub(super) artifact_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) target_arch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) target_triple: Option<String>,
+        #[serde(default)]
+        pub(super) tests: Vec<ItManifestEntryJson>,
+    }
+
+    pub(super) struct ArchivedItEntry {
+        pub(super) archive_path: PathBuf,
+        pub(super) bytes: Vec<u8>,
+        pub(super) mode: u32,
+    }
+
+    pub(super) fn build_bounded_tar_gz_with_limit(
+        entries: &[ArchivedItEntry],
+        max_uncompressed_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let mut total_uncompressed = 0u64;
+        let mut seen_paths = HashSet::new();
+        for entry in entries {
+            let clean = sanitize_relative_subpath(&entry.archive_path.to_string_lossy())?;
+            if !seen_paths.insert(clean) {
+                return Err(format!(
+                    "Duplicate archive path '{}' in IT bundle",
+                    entry.archive_path.display()
+                ));
+            }
+            total_uncompressed = total_uncompressed
+                .checked_add(entry.bytes.len() as u64)
+                .ok_or_else(|| "IT archive uncompressed size overflow".to_string())?;
+            if total_uncompressed > max_uncompressed_bytes {
+                return Err(format!(
+                    "IT archive uncompressed payload ({total_uncompressed} bytes) exceeds {max_uncompressed_bytes} byte budget"
+                ));
+            }
+        }
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        for entry in entries {
+            let clean = sanitize_relative_subpath(&entry.archive_path.to_string_lossy())?;
+            append_tar_file(&mut builder, &clean, &entry.bytes, entry.mode)?;
+        }
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finalize IT tar archive: {e}"))?;
+        let mut encoder = builder
+            .into_inner()
+            .map_err(|e| format!("Failed to unwrap IT tar builder: {e}"))?;
+        encoder
+            .flush()
+            .map_err(|e| format!("Failed to flush IT gzip stream: {e}"))?;
+        encoder
+            .finish()
+            .map_err(|e| format!("Failed to finish IT gzip stream: {e}"))
+    }
+
+    fn build_bounded_tar_gz(entries: &[ArchivedItEntry]) -> Result<Vec<u8>, String> {
+        build_bounded_tar_gz_with_limit(entries, MAX_IT_ARCHIVE_UNCOMPRESSED_BYTES)
+    }
+
+    fn track_homogeneous_elf(
+        homogeneous_machine: &mut Option<u16>,
+        bytes: &[u8],
+        expected_arch: Option<ExpectedElfArch>,
+        path: &Path,
+    ) -> Result<(), String> {
+        let Some((ei_class, e_machine)) = parse_elf_machine(bytes) else {
+            return Ok(());
+        };
+        if ei_class != 2 {
+            return Err(format!(
+                "IT binary '{}' is not a 64-bit ELF binary (EI_CLASS={}, expected 2)",
+                path.display(),
+                ei_class
+            ));
+        }
+        validate_elf_architecture(bytes, expected_arch, path)?;
+        if let Some(prev) = *homogeneous_machine {
+            if prev != e_machine {
+                return Err(format!(
+                    "Heterogeneous ELF architectures in IT bundle: '{}' has e_machine=0x{e_machine:04x}, expected 0x{prev:04x}",
+                    path.display()
+                ));
+            }
+        } else {
+            *homogeneous_machine = Some(e_machine);
+        }
+        Ok(())
+    }
+
+    pub(super) fn parse_smoke_binary_stem(file_name: &str) -> Option<String> {
+        let trimmed = file_name.trim();
+        if !trimmed.starts_with("smoke_") {
+            return None;
+        }
+        for ignored in [".d", ".o", ".rlib", ".rmeta", ".so", ".dylib", ".a", ".pdb"] {
+            if trimmed.ends_with(ignored) {
+                return None;
+            }
+        }
+        let stem = if let Some((prefix, suffix)) = trimmed.rsplit_once('-') {
+            if suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                prefix
+            } else {
+                trimmed
+            }
+        } else {
+            trimmed
+        };
+        if !stem.starts_with("smoke_") || stem.len() <= "smoke_".len() || stem.contains('.') {
+            return None;
+        }
+        Some(stem.to_string())
+    }
+
+    fn candidate_smoke_deps_dirs(expected_arch: Option<ExpectedElfArch>) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        match expected_arch {
+            Some(arch) => {
+                let triple = arch.target_triple();
+                dirs.push(PathBuf::from("target").join(triple).join("release/deps"));
+                dirs.push(PathBuf::from("target/release/deps"));
+                dirs.push(PathBuf::from("target").join(triple).join("debug/deps"));
+                dirs.push(PathBuf::from("target/debug/deps"));
+            }
+            None => {
+                dirs.push(PathBuf::from("target/release/deps"));
+                for arch in [
+                    ExpectedElfArch::Riscv64,
+                    ExpectedElfArch::X86_64,
+                    ExpectedElfArch::Aarch64,
+                ] {
+                    dirs.push(
+                        PathBuf::from("target")
+                            .join(arch.target_triple())
+                            .join("release/deps"),
+                    );
+                }
+                dirs.push(PathBuf::from("target/debug/deps"));
+                for arch in [
+                    ExpectedElfArch::Riscv64,
+                    ExpectedElfArch::X86_64,
+                    ExpectedElfArch::Aarch64,
+                ] {
+                    dirs.push(
+                        PathBuf::from("target")
+                            .join(arch.target_triple())
+                            .join("debug/deps"),
+                    );
+                }
+            }
+        }
+        dirs
+    }
+
+    fn package_it_directory(
+        dir_path: &Path,
+        service_name: &str,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<Option<PackagedArtifact>, String> {
+        let mut rel_files = Vec::new();
+        collect_sorted_files(dir_path, dir_path, &mut rel_files)?;
+        if rel_files.is_empty() {
+            return Ok(None);
+        }
+
+        let mut homogeneous_machine = None;
+        let mut entries = Vec::with_capacity(rel_files.len());
+        for rel in rel_files {
+            let full_path = dir_path.join(&rel);
+            let bytes = std::fs::read(&full_path)
+                .map_err(|e| format!("Failed to read '{}': {e}", full_path.display()))?;
+            track_homogeneous_elf(&mut homogeneous_machine, &bytes, expected_arch, &full_path)?;
+            let mode = if is_executable_file(&full_path, true) {
+                0o755
+            } else {
+                0o644
+            };
+            entries.push(ArchivedItEntry {
+                archive_path: rel,
+                bytes,
+                mode,
+            });
+        }
+
+        let gz_bytes = build_bounded_tar_gz(&entries)?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(Some(PackagedArtifact {
+            filename: format!("{service_name}-it.tar.gz"),
+            bytes: gz_bytes,
+            sha256_hex,
+        }))
+    }
+
+    fn matches_manifest_command_name(file_name: &str, target_base: &str) -> bool {
+        if file_name == target_base {
+            return true;
+        }
+        if let Some((prefix, suffix)) = file_name.rsplit_once('-') {
+            return prefix == target_base
+                && suffix.len() == 16
+                && suffix.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+        false
+    }
+
+    fn find_binary_in_cargo_outputs(
+        repo_workspace: &Path,
+        base_name: &str,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<Option<(PathBuf, Vec<u8>)>, String> {
+        let mut search_dirs = candidate_smoke_deps_dirs(expected_arch);
+        if let Some(arch) = expected_arch {
+            search_dirs.push(
+                PathBuf::from("target")
+                    .join(arch.target_triple())
+                    .join("release"),
+            );
+            search_dirs.push(
+                PathBuf::from("target")
+                    .join(arch.target_triple())
+                    .join("debug"),
+            );
+        }
+        search_dirs.push(PathBuf::from("target/release"));
+        search_dirs.push(PathBuf::from("target/debug"));
+
+        for rel_dir in search_dirs {
+            let abs_dir = repo_workspace.join(&rel_dir);
+            let Ok(dir_meta) = std::fs::symlink_metadata(&abs_dir) else {
+                continue;
+            };
+            if dir_meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink Cargo build directory '{}'",
+                    abs_dir.display()
+                ));
+            }
+            if !dir_meta.is_dir() {
+                continue;
+            }
+            let mut dir_entries: Vec<_> = std::fs::read_dir(&abs_dir)
+                .map_err(|e| format!("Failed reading '{}': {e}", abs_dir.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed listing '{}': {e}", abs_dir.display()))?;
+            dir_entries.sort_by_key(std::fs::DirEntry::file_name);
+
+            for entry in dir_entries {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !matches_manifest_command_name(&name, base_name) {
+                    continue;
+                }
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path)
+                    .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
+                if meta.file_type().is_symlink() {
+                    return Err(format!("Refusing symlink IT binary '{}'", path.display()));
+                }
+                if meta.is_file() {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|e| format!("Failed reading '{}': {e}", path.display()))?;
+                    return Ok(Some((path, bytes)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve_manifest_referenced_binary(
+        repo_workspace: &Path,
+        manifest_dir: &Path,
+        rel_cmd: &Path,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<(PathBuf, Vec<u8>), String> {
+        for direct in [manifest_dir.join(rel_cmd), repo_workspace.join(rel_cmd)] {
+            if let Ok(meta) = std::fs::symlink_metadata(&direct) {
+                if meta.file_type().is_symlink() {
+                    return Err(format!("Refusing symlink IT binary '{}'", direct.display()));
+                }
+                if meta.is_file() {
+                    let bytes = std::fs::read(&direct)
+                        .map_err(|e| format!("Failed reading '{}': {e}", direct.display()))?;
+                    return Ok((direct, bytes));
+                }
+            }
+        }
+
+        if let Some(base_name) = rel_cmd.file_name().and_then(|s| s.to_str()) {
+            if let Some(found) =
+                find_binary_in_cargo_outputs(repo_workspace, base_name, expected_arch)?
+            {
+                return Ok(found);
+            }
+        }
+
+        Err(format!(
+            "IT manifest references missing binary '{}'",
+            rel_cmd.display()
+        ))
+    }
+
+    fn package_it_manifest_file(
+        repo_workspace: &Path,
+        manifest_path: &Path,
+        raw_manifest: &[u8],
+        service_name: &str,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<PackagedArtifact, String> {
+        let parsed: ItManifestJson = serde_json::from_slice(raw_manifest).map_err(|e| {
+            format!(
+                "Failed to parse IT manifest '{}': {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest_dir = manifest_path.parent().unwrap_or(repo_workspace);
+        let mut homogeneous_machine = None;
+        let mut entries = vec![ArchivedItEntry {
+            archive_path: PathBuf::from("manifest.json"),
+            bytes: raw_manifest.to_vec(),
+            mode: 0o644,
+        }];
+        let mut packaged_cmds = HashSet::new();
+
+        for test in &parsed.tests {
+            let rel_cmd = sanitize_relative_subpath(&test.command)?;
+            let (found_path, bytes) = resolve_manifest_referenced_binary(
+                repo_workspace,
+                manifest_dir,
+                &rel_cmd,
+                expected_arch,
+            )?;
+            if bytes.is_empty() {
+                return Err(format!(
+                    "IT binary '{}' referenced by '{}' is empty",
+                    found_path.display(),
+                    manifest_path.display()
+                ));
+            }
+            if bytes.len() >= 4 && &bytes[..4] == b"\x7fELF" && parse_elf_machine(&bytes).is_none()
+            {
+                return Err(format!(
+                    "IT binary '{}' has truncated or invalid ELF header",
+                    found_path.display()
+                ));
+            }
+            track_homogeneous_elf(&mut homogeneous_machine, &bytes, expected_arch, &found_path)?;
+            if packaged_cmds.insert(rel_cmd.clone()) {
+                entries.push(ArchivedItEntry {
+                    archive_path: rel_cmd,
+                    bytes,
+                    mode: 0o755,
+                });
+            }
+        }
+
+        let gz_bytes = build_bounded_tar_gz(&entries)?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(PackagedArtifact {
+            filename: format!("{service_name}-it.tar.gz"),
+            bytes: gz_bytes,
+            sha256_hex,
+        })
+    }
+
+    struct SmokeBinaryCandidate {
+        dir_rank: usize,
+        arch_matches: bool,
+        mtime: SystemTime,
+        file_name: String,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    fn collect_smoke_candidates_in_dir(
+        abs_dir: &Path,
+        dir_rank: usize,
+        expected_arch: Option<ExpectedElfArch>,
+        by_stem: &mut BTreeMap<String, Vec<SmokeBinaryCandidate>>,
+    ) -> Result<(), String> {
+        let Ok(dir_meta) = std::fs::symlink_metadata(abs_dir) else {
+            return Ok(());
+        };
+        if dir_meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing symlink Cargo deps directory '{}'",
+                abs_dir.display()
+            ));
+        }
+        if !dir_meta.is_dir() {
+            return Ok(());
+        }
+
+        let mut dir_entries: Vec<_> = std::fs::read_dir(abs_dir)
+            .map_err(|e| format!("Failed listing '{}': {e}", abs_dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed reading entry in '{}': {e}", abs_dir.display()))?;
+        dir_entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in dir_entries {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = parse_smoke_binary_stem(&file_name) else {
+                continue;
+            };
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink smoke binary '{}'",
+                    path.display()
+                ));
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("Failed reading '{}': {e}", path.display()))?;
+            if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+                continue;
+            }
+            let Some((ei_class, e_machine)) = parse_elf_machine(&bytes) else {
+                return Err(format!(
+                    "Smoke binary '{}' has truncated or invalid ELF header",
+                    path.display()
+                ));
+            };
+            if ei_class != 2 {
+                return Err(format!(
+                    "Smoke binary '{}' is not a 64-bit ELF binary (EI_CLASS={}, expected 2)",
+                    path.display(),
+                    ei_class
+                ));
+            }
+            if ExpectedElfArch::from_e_machine(e_machine).is_none() {
+                return Err(format!(
+                    "Smoke binary '{}' has unsupported ELF e_machine=0x{e_machine:04x}",
+                    path.display()
+                ));
+            }
+            let arch_matches = expected_arch.is_none_or(|arch| arch.e_machine() == e_machine);
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            by_stem.entry(stem).or_default().push(SmokeBinaryCandidate {
+                dir_rank,
+                arch_matches,
+                mtime,
+                file_name,
+                path,
+                bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn discover_and_package_smoke_binaries(
+        repo_workspace: &Path,
+        summary: &CdManifestSummary,
+        expected_arch: Option<ExpectedElfArch>,
+        commit_sha: &str,
+        artifact_sha256: &str,
+    ) -> Result<Option<PackagedArtifact>, String> {
+        let mut by_stem: BTreeMap<String, Vec<SmokeBinaryCandidate>> = BTreeMap::new();
+        for (rank, rel_dir) in candidate_smoke_deps_dirs(expected_arch)
+            .into_iter()
+            .enumerate()
+        {
+            collect_smoke_candidates_in_dir(
+                &repo_workspace.join(rel_dir),
+                rank,
+                expected_arch,
+                &mut by_stem,
+            )?;
+        }
+
+        if by_stem.is_empty() {
+            return Ok(None);
+        }
+
+        let mut selected: Vec<(String, SmokeBinaryCandidate)> = Vec::new();
+        for (stem, mut candidates) in by_stem {
+            if expected_arch.is_some() && !candidates.iter().any(|c| c.arch_matches) {
+                validate_elf_architecture(
+                    &candidates[0].bytes,
+                    expected_arch,
+                    &candidates[0].path,
+                )?;
+            }
+            candidates.retain(|c| c.arch_matches);
+            candidates.sort_by(|a, b| {
+                a.dir_rank
+                    .cmp(&b.dir_rank)
+                    .then_with(|| b.mtime.cmp(&a.mtime))
+                    .then_with(|| a.file_name.cmp(&b.file_name))
+            });
+            if let Some(best) = candidates.into_iter().next() {
+                selected.push((stem, best));
+            }
+        }
+
+        if selected.is_empty() {
+            return Ok(None);
+        }
+
+        let mut homogeneous_machine = None;
+        for (_, cand) in &selected {
+            track_homogeneous_elf(
+                &mut homogeneous_machine,
+                &cand.bytes,
+                expected_arch,
+                &cand.path,
+            )?;
+        }
+
+        if !is_static_web_deployment(summary) {
+            for requested in &summary.integration_tests {
+                let trimmed = requested.trim();
+                if trimmed.starts_with("smoke_")
+                    && !selected.iter().any(|(stem, _)| stem == trimmed)
+                {
+                    return Err(format!(
+                        "CD manifest for '{}' requires smoke test '{}', but no matching compiled 64-bit ELF binary was found",
+                        summary.service_name, trimmed
+                    ));
+                }
+            }
+        }
+
+        let resolved_arch =
+            expected_arch.or_else(|| homogeneous_machine.and_then(ExpectedElfArch::from_e_machine));
+
+        let mut manifest_tests = Vec::with_capacity(selected.len());
+        let mut archive_entries = Vec::with_capacity(selected.len() + 1);
+        for (stem, cand) in selected {
+            let cmd_rel = format!("bin/{stem}");
+            manifest_tests.push(ItManifestEntryJson {
+                name: stem,
+                command: cmd_rel.clone(),
+                args: vec!["--nocapture".to_string()],
+                critical: true,
+                timeout_secs: Some(30),
+            });
+            archive_entries.push(ArchivedItEntry {
+                archive_path: PathBuf::from(cmd_rel),
+                bytes: cand.bytes,
+                mode: 0o755,
+            });
+        }
+
+        let manifest = ItManifestJson {
+            schema_version: 1,
+            service: summary.service_name.clone(),
+            git_commit: commit_sha.to_string(),
+            artifact_sha256: artifact_sha256.to_string(),
+            target_arch: resolved_arch.map(|a| a.label().to_string()),
+            target_triple: resolved_arch.map(|a| a.target_triple().to_string()),
+            tests: manifest_tests,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("Failed to serialize synthesized IT manifest JSON: {e}"))?;
+
+        let mut full_entries = Vec::with_capacity(archive_entries.len() + 1);
+        full_entries.push(ArchivedItEntry {
+            archive_path: PathBuf::from("manifest.json"),
+            bytes: manifest_bytes,
+            mode: 0o644,
+        });
+        full_entries.extend(archive_entries);
+
+        let gz_bytes = build_bounded_tar_gz(&full_entries)?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(Some(PackagedArtifact {
+            filename: format!("{}-it.tar.gz", summary.service_name),
+            bytes: gz_bytes,
+            sha256_hex,
+        }))
+    }
+
     fn build_fallback_it_manifest_tar_gz(
         service_name: &str,
         commit_sha: &str,
         artifact_sha256: &str,
     ) -> Result<Vec<u8>, String> {
-        let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 1,
-            "service": service_name,
-            "git_commit": commit_sha,
-            "artifact_sha256": artifact_sha256,
-            "tests": [],
-        }))
+        let manifest_bytes = serde_json::to_vec_pretty(&ItManifestJson {
+            schema_version: 1,
+            service: service_name.to_string(),
+            git_commit: commit_sha.to_string(),
+            artifact_sha256: artifact_sha256.to_string(),
+            target_arch: None,
+            target_triple: None,
+            tests: Vec::new(),
+        })
         .map_err(|e| format!("Failed to serialize IT manifest JSON: {e}"))?;
 
-        let encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let mut builder = Builder::new(encoder);
-        append_tar_file(
-            &mut builder,
-            Path::new("manifest.json"),
-            &manifest_bytes,
-            0o644,
-        )?;
-        builder
-            .finish()
-            .map_err(|e| format!("Failed to finish IT manifest tar archive: {e}"))?;
-        let mut encoder = builder
-            .into_inner()
-            .map_err(|e| format!("Failed to unwrap IT manifest tar builder: {e}"))?;
-        encoder
-            .flush()
-            .map_err(|e| format!("Failed to flush IT manifest gzip stream: {e}"))?;
-        encoder
-            .finish()
-            .map_err(|e| format!("Failed to finish IT manifest gzip stream: {e}"))
+        build_bounded_tar_gz(&[ArchivedItEntry {
+            archive_path: PathBuf::from("manifest.json"),
+            bytes: manifest_bytes,
+            mode: 0o644,
+        }])
     }
 
     pub(super) fn package_it_archive(
@@ -2619,6 +3255,7 @@ mod post_ci_cd {
         commit_sha: &str,
         artifact_sha256: &str,
     ) -> Result<PackagedArtifact, String> {
+        let expected_arch = infer_target_arch_from_nodes(&summary.target_nodes);
         const IT_DIR_CANDIDATES: [&str; 6] = [
             ".mucd/it",
             ".mucd/tests",
@@ -2639,14 +3276,10 @@ mod post_ci_cd {
                 ));
             }
             if meta.is_dir() {
-                let (gz_bytes, file_count) = package_directory_tar_gz(&dir_path, None, true)?;
-                if file_count > 0 {
-                    let sha256_hex = compute_sha256_hex(&gz_bytes);
-                    return Ok(PackagedArtifact {
-                        filename: format!("{}-it.tar.gz", summary.service_name),
-                        bytes: gz_bytes,
-                        sha256_hex,
-                    });
+                if let Some(pkg) =
+                    package_it_directory(&dir_path, &summary.service_name, expected_arch)?
+                {
+                    return Ok(pkg);
                 }
             }
         }
@@ -2670,25 +3303,44 @@ mod post_ci_cd {
             if meta.is_file() {
                 let raw = std::fs::read(&file_path)
                     .map_err(|e| format!("Failed to read '{}': {e}", file_path.display()))?;
-                let encoder = GzEncoder::new(Vec::new(), Compression::default());
-                let mut builder = Builder::new(encoder);
-                append_tar_file(&mut builder, Path::new("manifest.json"), &raw, 0o644)?;
-                builder
-                    .finish()
-                    .map_err(|e| format!("Failed to finalize IT tar archive: {e}"))?;
-                let gz_bytes = builder
-                    .into_inner()
-                    .map_err(|e| format!("Failed to unwrap IT tar builder: {e}"))?
-                    .finish()
-                    .map_err(|e| format!("Failed to finalize IT gzip archive: {e}"))?;
-                let sha256_hex = compute_sha256_hex(&gz_bytes);
-                return Ok(PackagedArtifact {
-                    filename: format!("{}-it.tar.gz", summary.service_name),
-                    bytes: gz_bytes,
-                    sha256_hex,
-                });
+                return package_it_manifest_file(
+                    repo_workspace,
+                    &file_path,
+                    &raw,
+                    &summary.service_name,
+                    expected_arch,
+                );
             }
         }
+
+        if let Some(pkg) = discover_and_package_smoke_binaries(
+            repo_workspace,
+            summary,
+            expected_arch,
+            commit_sha,
+            artifact_sha256,
+        )? {
+            return Ok(pkg);
+        }
+
+        let selects_custom_smoke = !is_static_web_deployment(summary)
+            && summary
+                .integration_tests
+                .iter()
+                .any(|t| t.trim().starts_with("smoke_"));
+        if selects_custom_smoke {
+            return Err(format!(
+                "CD manifest for '{}' selects custom smoke tests {:?}, but no .mucd/it* files or compiled smoke_* ELF binaries were found",
+                summary.service_name, summary.integration_tests
+            ));
+        }
+
+        tracing::warn!(
+            service = %summary.service_name,
+            commit = %commit_sha,
+            workspace = %repo_workspace.display(),
+            "No .mucd/it* directory, it-manifest.json, or compiled smoke_* ELF binaries found; packaging empty IT manifest fallback"
+        );
 
         let gz_bytes =
             build_fallback_it_manifest_tar_gz(&summary.service_name, commit_sha, artifact_sha256)?;
@@ -4696,5 +5348,372 @@ on_action:
         );
         assert!(sentinel_candidates.contains(&"musentinel".to_string()));
         assert!(sentinel_candidates.contains(&"muobserve-sentinel".to_string()));
+    }
+
+    fn make_test_elf32_header(e_machine: u16) -> Vec<u8> {
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 1; // ELF32
+        elf[5] = 1; // Little endian
+        elf[6] = 1; // EV_CURRENT
+        elf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn test_smoke_binary_stem_parsing_and_elf_validation_miri_safe() {
+        assert_eq!(
+            post_ci_cd::parse_smoke_binary_stem("smoke_mu_ci_controller"),
+            Some("smoke_mu_ci_controller".to_string())
+        );
+        assert_eq!(
+            post_ci_cd::parse_smoke_binary_stem("smoke_mu_registry-0123456789abcdef"),
+            Some("smoke_mu_registry".to_string())
+        );
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_foo.d"), None);
+        assert_eq!(
+            post_ci_cd::parse_smoke_binary_stem("smoke_foo-0123456789abcdef.d"),
+            None
+        );
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_foo.o"), None);
+        assert_eq!(
+            post_ci_cd::parse_smoke_binary_stem("libsmoke_foo.rlib"),
+            None
+        );
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_foo.rmeta"), None);
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_foo.so"), None);
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_foo.dylib"), None);
+        assert_eq!(post_ci_cd::parse_smoke_binary_stem("smoke_"), None);
+
+        let x86_elf = make_test_elf_header(0x003E);
+        let rv_elf = make_test_elf_header(0x00F3);
+        let arm_elf = make_test_elf_header(0x00B7);
+        let elf32 = make_test_elf32_header(0x003E);
+
+        assert!(post_ci_cd::validate_elf_architecture(
+            &x86_elf,
+            Some(post_ci_cd::ExpectedElfArch::X86_64),
+            Path::new("bin/smoke_x86")
+        )
+        .is_ok());
+        assert!(post_ci_cd::validate_elf_architecture(
+            &rv_elf,
+            Some(post_ci_cd::ExpectedElfArch::Riscv64),
+            Path::new("bin/smoke_rv")
+        )
+        .is_ok());
+        assert!(post_ci_cd::validate_elf_architecture(
+            &arm_elf,
+            Some(post_ci_cd::ExpectedElfArch::Aarch64),
+            Path::new("bin/smoke_arm")
+        )
+        .is_ok());
+
+        assert!(post_ci_cd::validate_elf_architecture(
+            &x86_elf,
+            Some(post_ci_cd::ExpectedElfArch::Riscv64),
+            Path::new("bin/smoke_bad_rv")
+        )
+        .is_err());
+        assert!(post_ci_cd::validate_elf_architecture(
+            &x86_elf,
+            Some(post_ci_cd::ExpectedElfArch::Aarch64),
+            Path::new("bin/smoke_bad_arm")
+        )
+        .is_err());
+        assert!(
+            post_ci_cd::validate_elf_architecture(&elf32, None, Path::new("bin/smoke_32bit"))
+                .is_err()
+        );
+
+        let summary = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"mu-ci-worker\"\nintegration_tests:\n  - \"smoke_mu_ci_worker\"\n",
+            "LMA1980/mu-ci-worker",
+        );
+        assert_eq!(
+            summary.integration_tests,
+            vec!["smoke_mu_ci_worker".to_string()]
+        );
+
+        let budget_err = post_ci_cd::build_bounded_tar_gz_with_limit(
+            &[post_ci_cd::ArchivedItEntry {
+                archive_path: std::path::PathBuf::from("bin/smoke_small"),
+                bytes: vec![0u8; 128],
+                mode: 0o755,
+            }],
+            64,
+        )
+        .unwrap_err();
+        assert!(budget_err.contains("budget"));
+    }
+
+    #[test]
+    fn test_package_it_archive_multi_arch_smoke_binaries_round_trip() {
+        use std::collections::BTreeMap;
+        use std::io::Read as _;
+
+        let cases = [
+            (
+                "node-x86_64",
+                0x003Eu16,
+                "x86_64",
+                "x86_64-unknown-linux-gnu",
+                "target/x86_64-unknown-linux-gnu/release/deps",
+            ),
+            (
+                "worker-riscv64",
+                0x00F3u16,
+                "riscv64",
+                "riscv64gc-unknown-linux-gnu",
+                "target/riscv64gc-unknown-linux-gnu/release/deps",
+            ),
+            (
+                "worker-aarch64",
+                0x00B7u16,
+                "aarch64",
+                "aarch64-unknown-linux-gnu",
+                "target/aarch64-unknown-linux-gnu/release/deps",
+            ),
+        ];
+
+        for (target_node, e_machine, expected_label, expected_triple, deps_rel) in cases {
+            let dir = tempdir().unwrap();
+            let deps_dir = dir.path().join(deps_rel);
+            std::fs::create_dir_all(&deps_dir).unwrap();
+
+            // Write matching smoke binary plus ignored Cargo metadata/library artifacts.
+            let mut smoke_bin = make_test_elf_header(e_machine);
+            smoke_bin.extend_from_slice(target_node.as_bytes());
+            std::fs::write(deps_dir.join("smoke_service-0123456789abcdef"), &smoke_bin).unwrap();
+            std::fs::write(
+                deps_dir.join("smoke_service-0123456789abcdef.d"),
+                b"dep-info",
+            )
+            .unwrap();
+            std::fs::write(deps_dir.join("smoke_service.o"), b"obj").unwrap();
+            std::fs::write(deps_dir.join("smoke_service.rlib"), b"rlib").unwrap();
+            std::fs::write(deps_dir.join("smoke_service.rmeta"), b"rmeta").unwrap();
+            std::fs::write(deps_dir.join("smoke_service.so"), b"so").unwrap();
+            std::fs::write(deps_dir.join("smoke_service.dylib"), b"dylib").unwrap();
+
+            // Also place a conflicting host-arch binary in target/release/deps to confirm
+            // target-arch-prioritized deduplication picks the matching target binary.
+            let host_deps = dir.path().join("target/release/deps");
+            std::fs::create_dir_all(&host_deps).unwrap();
+            let alt_machine = if e_machine == 0x003E { 0x00F3 } else { 0x003E };
+            std::fs::write(
+                host_deps.join("smoke_service-fedcba9876543210"),
+                make_test_elf_header(alt_machine),
+            )
+            .unwrap();
+
+            let yaml = format!(
+                "version: \"1\"\nservice: \"mu-test-svc\"\ntarget_nodes:\n  - \"{target_node}\"\n"
+            );
+            let summary = post_ci_cd::parse_cd_manifest_summary(&yaml, "LMA1980/mu-test-svc");
+            let packaged = post_ci_cd::package_it_archive(
+                dir.path(),
+                &summary,
+                "deadbeef12345678",
+                &"a".repeat(64),
+            )
+            .unwrap();
+
+            assert_eq!(packaged.filename, "mu-test-svc-it.tar.gz");
+            assert_eq!(
+                packaged.sha256_hex,
+                post_ci_cd::compute_sha256_hex(&packaged.bytes)
+            );
+
+            let mut archive =
+                tar::Archive::new(flate2::read::GzDecoder::new(packaged.bytes.as_slice()));
+            let mut extracted: BTreeMap<String, (u32, Vec<u8>)> = BTreeMap::new();
+            for entry in archive.entries().unwrap() {
+                let mut e = entry.unwrap();
+                assert!(e.header().entry_type().is_file());
+                let path = e.path().unwrap().display().to_string();
+                let mode = e.header().mode().unwrap() & 0o777;
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).unwrap();
+                extracted.insert(path, (mode, buf));
+            }
+
+            assert_eq!(extracted.len(), 2);
+            let (manifest_mode, manifest_bytes) = extracted.get("manifest.json").unwrap();
+            assert_eq!(*manifest_mode, 0o644);
+            let manifest: post_ci_cd::ItManifestJson =
+                serde_json::from_slice(manifest_bytes).unwrap();
+            assert_eq!(manifest.schema_version, 1);
+            assert_eq!(manifest.service, "mu-test-svc");
+            assert_eq!(manifest.git_commit, "deadbeef12345678");
+            assert_eq!(manifest.artifact_sha256, "a".repeat(64));
+            assert_eq!(manifest.target_arch.as_deref(), Some(expected_label));
+            assert_eq!(manifest.target_triple.as_deref(), Some(expected_triple));
+            assert_eq!(manifest.tests.len(), 1);
+            assert_eq!(manifest.tests[0].name, "smoke_service");
+            assert_eq!(manifest.tests[0].command, "bin/smoke_service");
+            assert_eq!(manifest.tests[0].args, vec!["--nocapture".to_string()]);
+            assert!(manifest.tests[0].critical);
+            assert_eq!(manifest.tests[0].timeout_secs, Some(30));
+
+            let (bin_mode, bin_bytes) = extracted.get("bin/smoke_service").unwrap();
+            assert_eq!(*bin_mode, 0o755);
+            assert_eq!(bin_bytes, &smoke_bin);
+        }
+    }
+
+    #[test]
+    fn test_package_it_archive_manifest_resolution_and_fail_closed_rejections() {
+        // 1. Mismatched ELF architecture (x86_64 binary for worker-riscv64 & worker-aarch64)
+        for target_node in ["worker-riscv64", "worker-aarch64"] {
+            let dir = tempdir().unwrap();
+            let deps = dir.path().join("target/release/deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::write(
+                deps.join("smoke_probe-1111111111111111"),
+                make_test_elf_header(0x003E),
+            )
+            .unwrap();
+            let yaml = format!(
+                "version: \"1\"\nservice: \"mu-test-svc\"\ntarget_nodes:\n  - \"{target_node}\"\n"
+            );
+            let summary = post_ci_cd::parse_cd_manifest_summary(&yaml, "LMA1980/mu-test-svc");
+            let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
+                .unwrap_err();
+            assert!(
+                err.contains("does not match"),
+                "expected ELF arch mismatch for {target_node}, got: {err}"
+            );
+        }
+
+        // 2. Heterogeneous ELF architectures when target_nodes is generic
+        {
+            let dir = tempdir().unwrap();
+            let deps = dir.path().join("target/release/deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::write(deps.join("smoke_a"), make_test_elf_header(0x003E)).unwrap();
+            std::fs::write(deps.join("smoke_b"), make_test_elf_header(0x00F3)).unwrap();
+            let summary = post_ci_cd::parse_cd_manifest_summary(
+                "version: \"1\"\nservice: \"mu-test-svc\"\n",
+                "LMA1980/mu-test-svc",
+            );
+            let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
+                .unwrap_err();
+            assert!(err.contains("Heterogeneous ELF"));
+        }
+
+        // 3. 32-bit EI_CLASS == 1 ELF rejected
+        {
+            let dir = tempdir().unwrap();
+            let deps = dir.path().join("target/release/deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::write(deps.join("smoke_elf32"), make_test_elf32_header(0x003E)).unwrap();
+            let summary = post_ci_cd::parse_cd_manifest_summary(
+                "version: \"1\"\nservice: \"mu-test-svc\"\n",
+                "LMA1980/mu-test-svc",
+            );
+            let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
+                .unwrap_err();
+            assert!(err.contains("not a 64-bit ELF"));
+        }
+
+        // 4. Symlink rejected in deps/
+        #[cfg(unix)]
+        {
+            let dir = tempdir().unwrap();
+            let deps = dir.path().join("target/release/deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            let target_file = dir.path().join("real_bin");
+            std::fs::write(&target_file, make_test_elf_header(0x003E)).unwrap();
+            std::os::unix::fs::symlink(&target_file, deps.join("smoke_link")).unwrap();
+            let summary = post_ci_cd::parse_cd_manifest_summary(
+                "version: \"1\"\nservice: \"mu-test-svc\"\n",
+                "LMA1980/mu-test-svc",
+            );
+            let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
+                .unwrap_err();
+            assert!(err.contains("symlink"));
+        }
+
+        // 5. Keep 64 MiB allocation in dedicated native test below so Miri runs stay fast.
+        let _ = post_ci_cd::MAX_IT_ARCHIVE_UNCOMPRESSED_BYTES;
+
+        // 6. Explicit it-manifest.json missing referenced binary -> fails closed; present -> packages it
+        {
+            let dir = tempdir().unwrap();
+            let mucd = dir.path().join(".mucd");
+            std::fs::create_dir_all(&mucd).unwrap();
+            std::fs::write(
+                mucd.join("it-manifest.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "service": "mu-test-svc",
+                    "tests": [{
+                        "name": "smoke_missing",
+                        "command": "bin/smoke_missing",
+                        "args": ["--nocapture"],
+                        "critical": true
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let summary = post_ci_cd::parse_cd_manifest_summary(
+                "version: \"1\"\nservice: \"mu-test-svc\"\ntarget_nodes:\n  - \"worker-riscv64\"\n",
+                "LMA1980/mu-test-svc",
+            );
+            let missing_err =
+                post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"c".repeat(64))
+                    .unwrap_err();
+            assert!(missing_err.contains("missing binary"));
+
+            let bin_dir = dir.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            std::fs::write(bin_dir.join("smoke_missing"), make_test_elf_header(0x00F3)).unwrap();
+            let ok_pkg =
+                post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"c".repeat(64))
+                    .unwrap();
+            let mut archive =
+                tar::Archive::new(flate2::read::GzDecoder::new(ok_pkg.bytes.as_slice()));
+            let names: Vec<String> = archive
+                .entries()
+                .unwrap()
+                .map(|e| e.unwrap().path().unwrap().display().to_string())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["manifest.json".to_string(), "bin/smoke_missing".to_string()]
+            );
+        }
+
+        // 7. Non-static-web daemon selecting custom smoke_* test with no IT binaries -> fail closed
+        {
+            let dir = tempdir().unwrap();
+            let summary = post_ci_cd::parse_cd_manifest_summary(
+                "version: \"1\"\nservice: \"mu-ci-worker\"\nintegration_tests:\n  - \"smoke_mu_ci_worker\"\n",
+                "LMA1980/mu-ci-worker",
+            );
+            let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"d".repeat(64))
+                .unwrap_err();
+            assert!(err.contains("smoke_mu_ci_worker"));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_package_it_archive_rejects_over_64mib_uncompressed_payload() {
+        let dir = tempdir().unwrap();
+        let deps = dir.path().join("target/release/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let mut oversized = make_test_elf_header(0x003E);
+        oversized.resize((64 * 1024 * 1024) + 128, 0);
+        std::fs::write(deps.join("smoke_huge"), &oversized).unwrap();
+        let summary = post_ci_cd::parse_cd_manifest_summary(
+            "version: \"1\"\nservice: \"mu-test-svc\"\n",
+            "LMA1980/mu-test-svc",
+        );
+        let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
+            .unwrap_err();
+        assert!(err.contains("budget"));
     }
 }
