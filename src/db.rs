@@ -1052,13 +1052,66 @@ impl CatalogStore {
         }
 
         recovered_records.sort_by_key(|r| r.job.queued_at);
-        let count = recovered_records.len();
-        self.upsert_records_batch(&recovered_records);
-        info!(
-            recovered_count = count,
-            "Backfilled and enriched historical job records from workspace log files"
-        );
+        let count = self.upsert_backfill_records_non_clobbering(&recovered_records);
+        if count > 0 {
+            info!(
+                recovered_count = count,
+                "Backfilled and enriched historical job records from workspace log files"
+            );
+        }
         count
+    }
+
+    /// Inserts or enriches backfilled historical job records atomically without overwriting newer
+    /// live jobs already present in the catalog.
+    ///
+    /// - Absent `job_id`: inserted normally.
+    /// - Existing non-terminal (`Queued`, `Running`, `Skipped`) record: preserved untouched.
+    /// - Existing terminal (`Completed`, `Failed`) record: preserved unless its `metrics` (or
+    ///   submodule metrics when the candidate has non-empty submodules) are missing, in which case
+    ///   only `metrics` is enriched while preserving live status, stages, and timestamps.
+    pub fn upsert_backfill_records_non_clobbering(&self, records: &[JobRecord]) -> usize {
+        let Ok(mut guard) = self.inner.lock() else {
+            warn!("CatalogStore mutex poisoned during upsert_backfill_records_non_clobbering");
+            return 0;
+        };
+
+        let mut applied = 0usize;
+        for rec in records {
+            if let Some(existing_central) = guard.jobs.get(&rec.job.id) {
+                let Ok(mut existing_rec) =
+                    serde_json::from_str::<JobRecord>(&existing_central.record_json)
+                else {
+                    continue;
+                };
+                let is_terminal = matches!(
+                    existing_rec.status,
+                    JobStatus::Completed { .. } | JobStatus::Failed { .. }
+                );
+                if !is_terminal {
+                    continue;
+                }
+                let Some(ref candidate_metrics) = rec.metrics else {
+                    continue;
+                };
+                let needs_enrichment = existing_rec.metrics.is_none()
+                    || (existing_rec
+                        .metrics
+                        .as_ref()
+                        .is_some_and(|m| m.submodules.is_empty())
+                        && !candidate_metrics.submodules.is_empty());
+                if !needs_enrichment {
+                    continue;
+                }
+                existing_rec.metrics = Some(candidate_metrics.clone());
+                Self::upsert_record_inner(&mut guard, &existing_rec);
+                applied += 1;
+            } else {
+                Self::upsert_record_inner(&mut guard, rec);
+                applied += 1;
+            }
+        }
+        applied
     }
 
     pub fn extract_metrics_from_log_and_workspace(
@@ -1563,5 +1616,166 @@ mod tests {
             .read_platform_auth(|st| st.users.get("legacyalice").is_some_and(|u| u.revoked))
             .unwrap();
         assert!(platform_revoked);
+    }
+
+    #[test]
+    fn test_upsert_backfill_records_non_clobbering_preserves_live_jobs_and_enriches_metrics() {
+        let store = CatalogStore::new();
+        let now = Utc::now();
+
+        let make_job = |id: &str, commit: &str| Job {
+            id: id.to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/example-service".to_string(),
+            clone_url: String::new(),
+            commit_sha: commit.to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: None,
+        };
+
+        // 1. Live non-terminal job already in catalog
+        let live_queued = JobRecord {
+            job: make_job("job-live-queued", "aaaa1111"),
+            status: JobStatus::Queued,
+            log_file: PathBuf::from("logs/live.log"),
+            updated_at: now,
+            metrics: None,
+            stages: Vec::new(),
+        };
+        store.upsert_record(&live_queued);
+
+        // 2. Existing terminal job with live metrics already populated
+        let live_completed_with_metrics = JobRecord {
+            job: make_job("job-live-completed", "bbbb2222"),
+            status: JobStatus::Completed {
+                duration_secs: 42,
+                exit_code: 0,
+            },
+            log_file: PathBuf::from("logs/live-comp.log"),
+            updated_at: now,
+            metrics: Some(JobMetrics {
+                quality_score: 99,
+                letter_grade: "A+".to_string(),
+                coverage_pct: Some(95.0),
+                benchmark_summary: None,
+                tests_passed: 50,
+                tests_total: 50,
+                advisories_count: 0,
+                clippy_warnings: 0,
+                submodules: BTreeMap::new(),
+            }),
+            stages: Vec::new(),
+        };
+        store.upsert_record(&live_completed_with_metrics);
+
+        // 3. Existing terminal job missing metrics (eligible for metrics-only enrichment)
+        let terminal_missing_metrics = JobRecord {
+            job: make_job("job-terminal-enrich", "cccc3333"),
+            status: JobStatus::Completed {
+                duration_secs: 17,
+                exit_code: 0,
+            },
+            log_file: PathBuf::from("logs/enrich.log"),
+            updated_at: now,
+            metrics: None,
+            stages: Vec::new(),
+        };
+        store.upsert_record(&terminal_missing_metrics);
+
+        // Attempt concurrent backfill batch containing colliding IDs + a genuinely absent ID.
+        let stale_metrics = JobMetrics {
+            quality_score: 70,
+            letter_grade: "C".to_string(),
+            coverage_pct: None,
+            benchmark_summary: None,
+            tests_passed: 3,
+            tests_total: 4,
+            advisories_count: 0,
+            clippy_warnings: 0,
+            submodules: BTreeMap::new(),
+        };
+        let backfill_batch = vec![
+            JobRecord {
+                job: make_job("job-live-queued", "stale0000"),
+                status: JobStatus::Completed {
+                    duration_secs: 1,
+                    exit_code: 0,
+                },
+                log_file: PathBuf::from("logs/stale-queued.log"),
+                updated_at: now - ChronoDuration::seconds(30),
+                metrics: Some(stale_metrics.clone()),
+                stages: Vec::new(),
+            },
+            JobRecord {
+                job: make_job("job-live-completed", "stale1111"),
+                status: JobStatus::Failed {
+                    error: "stale".to_string(),
+                },
+                log_file: PathBuf::from("logs/stale-comp.log"),
+                updated_at: now - ChronoDuration::seconds(30),
+                metrics: Some(stale_metrics.clone()),
+                stages: Vec::new(),
+            },
+            JobRecord {
+                job: make_job("job-terminal-enrich", "stale2222"),
+                status: JobStatus::Failed {
+                    error: "should-not-overwrite-status".to_string(),
+                },
+                log_file: PathBuf::from("logs/stale-enrich.log"),
+                updated_at: now - ChronoDuration::seconds(30),
+                metrics: Some(stale_metrics.clone()),
+                stages: Vec::new(),
+            },
+            JobRecord {
+                job: make_job("job-historical-new", "dddd4444"),
+                status: JobStatus::Completed {
+                    duration_secs: 12,
+                    exit_code: 0,
+                },
+                log_file: PathBuf::from("logs/historical.log"),
+                updated_at: now - ChronoDuration::seconds(60),
+                metrics: Some(stale_metrics),
+                stages: Vec::new(),
+            },
+        ];
+
+        // Only job-terminal-enrich (metrics-only) and job-historical-new (new) should apply.
+        let applied = store.upsert_backfill_records_non_clobbering(&backfill_batch);
+        assert_eq!(applied, 2);
+
+        // Live queued job untouched
+        let got_queued = store.get_job("job-live-queued").unwrap();
+        assert!(matches!(got_queued.status, JobStatus::Queued));
+        assert_eq!(got_queued.job.commit_sha, "aaaa1111");
+        assert!(got_queued.metrics.is_none());
+
+        // Live completed job with metrics untouched
+        let got_completed = store.get_job("job-live-completed").unwrap();
+        assert!(matches!(
+            got_completed.status,
+            JobStatus::Completed {
+                duration_secs: 42,
+                exit_code: 0
+            }
+        ));
+        assert_eq!(got_completed.metrics.unwrap().quality_score, 99);
+
+        // Terminal job missing metrics enriched WITHOUT overwriting live status or commit_sha
+        let got_enriched = store.get_job("job-terminal-enrich").unwrap();
+        assert!(matches!(
+            got_enriched.status,
+            JobStatus::Completed {
+                duration_secs: 17,
+                exit_code: 0
+            }
+        ));
+        assert_eq!(got_enriched.job.commit_sha, "cccc3333");
+        assert_eq!(got_enriched.metrics.unwrap().quality_score, 70);
+
+        // Absent historical job inserted cleanly
+        let got_hist = store.get_job("job-historical-new").unwrap();
+        assert_eq!(got_hist.job.commit_sha, "dddd4444");
     }
 }
