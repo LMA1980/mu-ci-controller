@@ -217,6 +217,7 @@ impl Drop for InFlightJobGuard {
 pub struct JobStore {
     inner: Arc<RwLock<VecDeque<JobRecord>>>,
     db: Arc<dyn crate::storage_backend::ControllerStorage>,
+    local_catalog: Option<Arc<crate::db::CatalogStore>>,
     notify: Arc<Notify>,
     max_history: usize,
     index_file: Option<PathBuf>,
@@ -229,45 +230,105 @@ pub struct JobStore {
 impl JobStore {
     fn default_storage(
         workspace_dir: Option<&Path>,
-    ) -> Arc<dyn crate::storage_backend::ControllerStorage> {
-        let local_catalog = Arc::new(crate::db::CatalogStore::new());
-        if let Some(ws) = workspace_dir {
-            local_catalog.backfill_from_logs_dir(ws);
-        }
-
-        let in_memory_storage = Arc::new(crate::storage_backend::InMemoryStorage::new(Arc::clone(
-            &local_catalog,
-        )));
+        run_sync_backfill: bool,
+    ) -> (
+        Arc<dyn crate::storage_backend::ControllerStorage>,
+        Option<Arc<crate::db::CatalogStore>>,
+    ) {
         let mode = crate::storage_backend::StorageBackendMode::from_env();
-        match mode {
-            crate::storage_backend::StorageBackendMode::InMemory => in_memory_storage,
-            crate::storage_backend::StorageBackendMode::MuObserveRemote => {
-                if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
-                    match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
-                        Ok(remote) => Arc::new(remote),
-                        Err(e) => {
-                            warn!(
-                                "Failed to initialize MuObserveRemoteStorage ({}), falling back to InMemoryStorage",
-                                e
-                            );
-                            in_memory_storage
-                        }
+        if mode == crate::storage_backend::StorageBackendMode::MuObserveRemote {
+            if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
+                match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
+                    Ok(remote) => return (Arc::new(remote), None),
+                    Err(e) => {
+                        warn!(
+                            "Failed to initialize MuObserveRemoteStorage ({}), falling back to InMemoryStorage",
+                            e
+                        );
                     }
-                } else {
-                    in_memory_storage
                 }
             }
         }
+
+        let local_catalog = Arc::new(crate::db::CatalogStore::new());
+        if run_sync_backfill {
+            if let Some(ws) = workspace_dir {
+                local_catalog.backfill_from_logs_dir(ws);
+            }
+        }
+        let in_memory_storage = Arc::new(crate::storage_backend::InMemoryStorage::new(Arc::clone(
+            &local_catalog,
+        )));
+        (in_memory_storage, Some(local_catalog))
     }
 
     pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
-        let storage = Self::default_storage(workspace_dir);
-        Self::with_storage(max_history, workspace_dir, storage)
+        let (storage, local_catalog) = Self::default_storage(workspace_dir, true);
+        let mut store = Self::with_storage(max_history, workspace_dir, storage);
+        store.local_catalog = local_catalog;
+        store
     }
 
     pub fn from_config(max_history: usize, config: &crate::config::Config) -> Self {
-        let storage = Self::default_storage(Some(&config.workspace_dir));
-        Self::from_config_with_storage(max_history, config, storage)
+        let (storage, local_catalog) = Self::default_storage(Some(&config.workspace_dir), false);
+        let mut store = Self::from_config_with_storage(max_history, config, storage);
+        store.local_catalog = local_catalog;
+        store
+    }
+
+    /// Spawns historical workspace log backfill on a blocking worker thread so controller startup
+    /// never delays HTTP listener binding or `/health` readiness.
+    ///
+    /// Returns `None` when a remote storage backend (`MuObserveRemoteStorage`) or custom external
+    /// storage is active. When a local `CatalogStore` is active, recovered historical records are
+    /// merged into both the catalog and in-memory queue without overwriting newer live jobs.
+    pub fn spawn_background_log_backfill(
+        &self,
+        workspace_dir: PathBuf,
+    ) -> Option<tokio::task::JoinHandle<usize>> {
+        let catalog = self.local_catalog.clone()?;
+        let store = self.clone();
+        Some(tokio::spawn(async move {
+            let recovered =
+                tokio::task::spawn_blocking(move || catalog.backfill_from_logs_dir(&workspace_dir))
+                    .await
+                    .unwrap_or_else(|err| {
+                        warn!(error = %err, "Background workspace log backfill task failed");
+                        0
+                    });
+            if recovered > 0 {
+                store.merge_backfilled_history_into_memory().await;
+            }
+            recovered
+        }))
+    }
+
+    async fn merge_backfilled_history_into_memory(&self) {
+        let recent = self.run_storage_op(|db| db.load_recent_jobs(self.max_history));
+        if recent.is_empty() {
+            return;
+        }
+        let mut guard = self.inner.write().await;
+        let existing_ids: std::collections::HashSet<String> =
+            guard.iter().map(|r| r.job.id.clone()).collect();
+        let mut added = false;
+        for rec in recent {
+            if !existing_ids.contains(&rec.job.id) {
+                guard.push_back(rec);
+                added = true;
+            }
+        }
+        if added {
+            let mut merged: Vec<JobRecord> = guard.drain(..).collect();
+            merged.sort_by(|a, b| {
+                b.job
+                    .queued_at
+                    .cmp(&a.job.queued_at)
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+            merged.truncate(self.max_history);
+            guard.extend(merged);
+        }
     }
 
     pub fn from_config_with_storage(
@@ -434,6 +495,7 @@ impl JobStore {
         Self {
             inner: Arc::new(RwLock::new(initial_jobs)),
             db,
+            local_catalog: None,
             notify,
             max_history,
             index_file,

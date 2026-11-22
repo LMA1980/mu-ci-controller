@@ -126,6 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let _ = state
+        .job_store
+        .spawn_background_log_backfill(state.config.workspace_dir.clone());
     axum::serve(listener, app).await?;
 
     Ok(())

@@ -433,3 +433,152 @@ fn test_config_resolve_secret_fail_closed_on_missing_path() {
     assert_eq!(Config::resolve_secret(env_key), None);
     std::env::remove_var(env_key);
 }
+
+#[tokio::test]
+async fn test_startup_health_ready_before_async_log_backfill_and_preserves_live_jobs() {
+    use chrono::Utc;
+    use mu_ci_controller::app::create_router;
+    use mu_ci_controller::cluster::ClusterRegistry;
+    use mu_ci_controller::config::Config;
+    use mu_ci_controller::job::{Job, JobStore};
+    use mu_ci_controller::webhook::AppState;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    let tmp_ws = tempfile::tempdir().expect("tempdir");
+    let repo_logs = tmp_ws
+        .path()
+        .join("logs")
+        .join("LMA1980")
+        .join("example-service");
+    std::fs::create_dir_all(&repo_logs).expect("create repo logs dir");
+
+    // Seed two historical workspace log files: one purely historical and one colliding with a live job.
+    std::fs::write(
+        repo_logs.join("job-1729500000-deadbeef.log"),
+        "2026-10-21T10:00:00Z [worker-x86] [test] [stdout] running 5 tests\n2026-10-21T10:00:02Z [worker-x86] [test] [stdout] test result: ok. 5 passed; 0 failed; 0 ignored\n",
+    )
+    .expect("write historical log");
+    std::fs::write(
+        repo_logs.join("job-1729500099-cafebabe.log"),
+        "2026-10-21T10:05:00Z [worker-x86] [test] [stdout] running 1 tests\n2026-10-21T10:05:01Z [worker-x86] [test] [stdout] test result: ok. 1 passed; 0 failed; 0 ignored\n",
+    )
+    .expect("write colliding historical log");
+
+    let mut cfg = Config::load();
+    cfg.workspace_dir = tmp_ws.path().to_path_buf();
+    cfg.ha_role = mu_ci_controller::config::HaRoleConfig::Leader;
+    cfg.node_id = "node-a".to_string();
+
+    // 1. JobStore::from_config must NOT synchronously block on disk log backfill.
+    let job_store = JobStore::from_config(100, &cfg);
+    assert!(
+        job_store
+            .find_latest_job("LMA1980/example-service", None)
+            .await
+            .is_none(),
+        "JobStore::from_config must defer workspace log backfill off the startup critical path"
+    );
+
+    let cluster = ClusterRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(32);
+    let state = Arc::new(AppState {
+        config: cfg.clone(),
+        job_store: job_store.clone(),
+        cluster,
+        tx,
+        log_broadcaster,
+        console: mu_ci_controller::console::ConsoleState::default(),
+    });
+    let app = create_router(state.clone());
+
+    // 2. Bind HTTP listener and verify /health responds 200 OK immediately before backfill runs.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral listener");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to controller HTTP listener");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write GET /health");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read /health response");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected immediate 200 OK from /health, got: {response}"
+    );
+
+    // 3. Enqueue a live Queued job sharing the colliding job_id before spawning background backfill.
+    let live_job = Job {
+        id: "job-1729500099-cafebabe".to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/example-service".to_string(),
+        clone_url: String::new(),
+        commit_sha: "livefeed12345678".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now(),
+        pr_number: None,
+    };
+    job_store
+        .enqueue_job(
+            live_job,
+            std::path::PathBuf::from("logs/LMA1980/example-service/job-1729500099-cafebabe.log"),
+        )
+        .await;
+
+    // 4. Spawn background log backfill and await completion.
+    let backfill_handle = job_store
+        .spawn_background_log_backfill(cfg.workspace_dir.clone())
+        .expect("InMemoryStorage must spawn background backfill");
+    let recovered_count = backfill_handle.await.expect("backfill join");
+    assert_eq!(
+        recovered_count, 1,
+        "only the non-colliding historical log should be backfilled"
+    );
+
+    // 5. Historical record is recovered cleanly in both CatalogStore and in-memory list_jobs.
+    let historical = job_store
+        .find_latest_job("LMA1980/example-service", None)
+        .await
+        .expect("historical job reconstructed by background backfill");
+    assert_eq!(historical.job.id, "job-1729500000-deadbeef");
+    assert_eq!(historical.job.commit_sha, "deadbeef");
+    assert_eq!(
+        historical
+            .metrics
+            .expect("reconstructed metrics")
+            .tests_passed,
+        5
+    );
+
+    // 6. Live job was NEVER clobbered in either storage or in-memory queue.
+    let jobs = job_store.list_jobs().await;
+    let got_live = jobs
+        .iter()
+        .find(|j| j.job.id == "job-1729500099-cafebabe")
+        .expect("live job must remain in list_jobs");
+    assert!(matches!(
+        got_live.status,
+        mu_ci_controller::job::JobStatus::Queued
+    ));
+    assert_eq!(got_live.job.commit_sha, "livefeed12345678");
+    assert!(
+        jobs.iter().any(|j| j.job.id == "job-1729500000-deadbeef"),
+        "recovered historical job must be merged into list_jobs"
+    );
+
+    server_handle.abort();
+}
