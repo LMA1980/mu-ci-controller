@@ -1842,11 +1842,20 @@ pub fn load_cd_api_token_from_values(
     load_secret_from_values(token_file, token_literal_or_path)
 }
 
-/// Loads the `MuConDe` CD API bearer token from `MUCONDE_CD_API_TOKEN_FILE` or `MUCONDE_CD_API_TOKEN`.
+/// Loads the `MuConDe` CD API bearer token from `MU_CD_CONTROLLER_API_TOKEN*`,
+/// `MU_CD_API_TOKEN*`, or legacy `MUCONDE_CD_API_TOKEN*`.
 #[must_use]
 pub fn load_cd_api_token() -> Option<String> {
-    let token_file = std::env::var("MUCONDE_CD_API_TOKEN_FILE").ok();
-    let token_val = std::env::var("MUCONDE_CD_API_TOKEN").ok();
+    let token_file = first_non_empty_env(&[
+        "MU_CD_CONTROLLER_API_TOKEN_FILE",
+        "MU_CD_API_TOKEN_FILE",
+        "MUCONDE_CD_API_TOKEN_FILE",
+    ]);
+    let token_val = first_non_empty_env(&[
+        "MU_CD_CONTROLLER_API_TOKEN",
+        "MU_CD_API_TOKEN",
+        "MUCONDE_CD_API_TOKEN",
+    ]);
     load_cd_api_token_from_values(token_file.as_deref(), token_val.as_deref())
 }
 
@@ -3548,7 +3557,11 @@ pub async fn trigger_post_ci_cd_pipeline(job: &Job, repo_workspace: &Path) -> bo
         "MU_CI_CONTROLLER_TLS_KEY",
         "ACTION_RUNNER_TLS_KEY",
     ]);
-    let muconde_url = first_non_empty_env(&["MUCONDE_CD_API_URL"]);
+    let muconde_url = first_non_empty_env(&[
+        "MU_CD_CONTROLLER_API_URL",
+        "MU_CD_API_URL",
+        "MUCONDE_CD_API_URL",
+    ]);
     let cd_token = load_cd_api_token();
 
     let cfg = PostCiCdEndpointConfig {
@@ -3732,11 +3745,10 @@ pub async fn trigger_post_ci_cd_pipeline_with_config(
     let deploy_url = format!("{}/api/cd/deploy", cd_url_base.trim_end_matches('/'));
     let mut deploy_payload = serde_json::json!({
         "repo": job.repo_name,
-        "artifact_sha256": binary.sha256_hex,
+        "service": summary.service_name,
         "git_commit": job.commit_sha,
         "binary_digest": binary.sha256_hex,
         "it_archive_digest": it_archive.sha256_hex,
-        "manifest_yaml": manifest_yaml,
         "wait": false,
     });
     if let Some(id) = bundle_id.as_deref() {
@@ -3757,8 +3769,9 @@ pub async fn trigger_post_ci_cd_pipeline_with_config(
                 repo = %job.repo_name,
                 service = %summary.service_name,
                 commit = %job.commit_sha,
-                artifact_sha256 = %binary.sha256_hex,
-                "Triggered post-CI MuConDe rollout deployment"
+                binary_digest = %binary.sha256_hex,
+                it_archive_digest = %it_archive.sha256_hex,
+                "Triggered post-CI MuConDe digest-only rollout notification"
             );
             true
         }
@@ -4582,12 +4595,32 @@ on_action:
         assert_eq!(deploy_calls[0].1, reg_calls[0].0);
         let deploy_body = &deploy_calls[0].2;
         assert_eq!(deploy_body["repo"], "LMA1980/mu-console");
-        assert_eq!(deploy_body["artifact_sha256"], expected_bin_sha);
-        assert_ne!(deploy_body["artifact_sha256"], "deadbeefcafe1234");
+        assert_eq!(deploy_body["service"], "muconsole");
         assert_eq!(deploy_body["git_commit"], "deadbeefcafe1234");
         assert_eq!(deploy_body["binary_digest"], expected_bin_sha);
+        assert_ne!(deploy_body["binary_digest"], "deadbeefcafe1234");
         assert_eq!(deploy_body["it_archive_digest"], expected_it_sha);
         assert_eq!(deploy_body["bundle_id"], "bundle-static-001");
+        assert_eq!(deploy_body["wait"], false);
+        let obj = deploy_body.as_object().expect("deploy JSON object");
+        assert!(!obj.contains_key("manifest_yaml"));
+        assert!(!obj.contains_key("config"));
+        assert!(!obj.contains_key("repo_path"));
+        assert!(!obj.contains_key("artifact_sha256"));
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "binary_digest",
+                "bundle_id",
+                "git_commit",
+                "it_archive_digest",
+                "repo",
+                "service",
+                "wait",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -4747,10 +4780,17 @@ on_action:
         let deploys = deploy_bodies.lock().unwrap().clone();
         assert_eq!(deploys.len(), 1);
         let expected_sha = post_ci_cd::compute_sha256_hex(&custom_bin_bytes);
-        assert_eq!(deploys[0]["artifact_sha256"], expected_sha);
+        let expected_it_sha = post_ci_cd::compute_sha256_hex(&captured[0].it_bytes);
+        assert_eq!(deploys[0]["repo"], "LMA1980/mu-ci-controller");
+        assert_eq!(deploys[0]["service"], "action-runner-controller");
+        assert_eq!(deploys[0]["binary_digest"], expected_sha);
+        assert_eq!(deploys[0]["it_archive_digest"], expected_it_sha);
         assert_eq!(deploys[0]["git_commit"], "abc123def456");
-        assert_ne!(deploys[0]["artifact_sha256"], deploys[0]["git_commit"]);
+        assert_ne!(deploys[0]["binary_digest"], deploys[0]["git_commit"]);
         assert_eq!(deploys[0]["bundle_id"], "bundle-bin-002");
+        assert_eq!(deploys[0]["wait"], false);
+        assert!(deploys[0].get("manifest_yaml").is_none());
+        assert!(deploys[0].get("artifact_sha256").is_none());
     }
 
     #[tokio::test]
