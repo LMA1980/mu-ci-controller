@@ -1030,7 +1030,12 @@ impl DAGScheduler {
                             Some(&target_url),
                         )
                         .await;
-                        let _ = trigger_post_ci_cd_pipeline(&job, &repo_workspace).await;
+                        let post_ci_job = job.clone();
+                        let post_ci_workspace = repo_workspace.clone();
+                        tokio::spawn(async move {
+                            let _ =
+                                trigger_post_ci_cd_pipeline(&post_ci_job, &post_ci_workspace).await;
+                        });
                     }
                 }
                 self.job_store.flush_job_log(Some(&job.id));
@@ -1929,7 +1934,7 @@ pub struct PostCiCdEndpointConfig<'a> {
 }
 
 mod post_ci_cd {
-    use super::extract_cd_service_name;
+    use super::{extract_cd_service_name, first_non_empty_env};
     use flate2::{read::GzDecoder, write::GzEncoder, Compression};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -2502,25 +2507,17 @@ mod post_ci_cd {
         names
     }
 
-    fn candidate_release_dirs(expected_arch: Option<ExpectedElfArch>) -> Vec<PathBuf> {
+    fn candidate_target_release_subdirs(expected_arch: Option<ExpectedElfArch>) -> Vec<PathBuf> {
         match expected_arch {
             Some(arch) => vec![
-                PathBuf::from("target")
-                    .join(arch.target_triple())
-                    .join("release"),
-                PathBuf::from("target/release"),
+                PathBuf::from(arch.target_triple()).join("release"),
+                PathBuf::from("release"),
             ],
             None => vec![
-                PathBuf::from("target/release"),
-                PathBuf::from("target")
-                    .join(ExpectedElfArch::Riscv64.target_triple())
-                    .join("release"),
-                PathBuf::from("target")
-                    .join(ExpectedElfArch::X86_64.target_triple())
-                    .join("release"),
-                PathBuf::from("target")
-                    .join(ExpectedElfArch::Aarch64.target_triple())
-                    .join("release"),
+                PathBuf::from("release"),
+                PathBuf::from(ExpectedElfArch::Riscv64.target_triple()).join("release"),
+                PathBuf::from(ExpectedElfArch::X86_64.target_triple()).join("release"),
+                PathBuf::from(ExpectedElfArch::Aarch64.target_triple()).join("release"),
             ],
         }
     }
@@ -2560,8 +2557,9 @@ mod post_ci_cd {
         }))
     }
 
-    fn resolve_binary_artifact(
-        repo_workspace: &Path,
+    fn resolve_binary_artifact_in_dirs(
+        workspace_root: &Path,
+        target_dir: &Path,
         repo_name: &str,
         summary: &CdManifestSummary,
     ) -> Result<PackagedArtifact, String> {
@@ -2570,7 +2568,7 @@ mod post_ci_cd {
 
         if let Some(raw_art) = summary.artifact.as_deref() {
             let rel_art = sanitize_relative_subpath(art_or_raw(raw_art))?;
-            let art_path = repo_workspace.join(&rel_art);
+            let art_path = workspace_root.join(&rel_art);
             if let Some(pkg) = read_validated_binary(&art_path, expected_arch)? {
                 return Ok(pkg);
             }
@@ -2587,15 +2585,15 @@ mod post_ci_cd {
         if let Some(explicit_bin) = summary.binary.as_deref() {
             if explicit_bin.contains('/') {
                 let rel_bin = sanitize_relative_subpath(explicit_bin)?;
-                let bin_path = repo_workspace.join(&rel_bin);
+                let bin_path = workspace_root.join(&rel_bin);
                 if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
                     return Ok(pkg);
                 }
             }
         }
 
-        for rel_dir in candidate_release_dirs(expected_arch) {
-            let abs_dir = repo_workspace.join(&rel_dir);
+        for rel_dir in candidate_target_release_subdirs(expected_arch) {
+            let abs_dir = target_dir.join(&rel_dir);
             for bin_name in &candidates {
                 let bin_path = abs_dir.join(bin_name);
                 if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
@@ -2605,10 +2603,24 @@ mod post_ci_cd {
         }
 
         Err(format!(
-            "No release binary found in '{}' matching candidates {:?}",
-            repo_workspace.display(),
+            "No release binary found in '{}' (target_dir '{}') matching candidates {:?}",
+            workspace_root.display(),
+            target_dir.display(),
             candidates
         ))
+    }
+
+    fn resolve_binary_artifact(
+        repo_workspace: &Path,
+        repo_name: &str,
+        summary: &CdManifestSummary,
+    ) -> Result<PackagedArtifact, String> {
+        resolve_binary_artifact_in_dirs(
+            repo_workspace,
+            &repo_workspace.join("target"),
+            repo_name,
+            summary,
+        )
     }
 
     const fn art_or_raw(raw: &str) -> &str {
@@ -2643,7 +2655,7 @@ mod post_ci_cd {
         pub(super) args: Vec<String>,
         #[serde(default = "default_it_critical")]
         pub(super) critical: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) timeout_secs: Option<u64>,
     }
 
@@ -3361,6 +3373,789 @@ mod post_ci_cd {
         })
     }
 
+    struct EphemeralCheckoutDir {
+        path: PathBuf,
+    }
+
+    impl EphemeralCheckoutDir {
+        fn create() -> Result<Self, String> {
+            let path = std::env::temp_dir().join(format!("mu-ci-postcd-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).map_err(|e| {
+                format!(
+                    "Failed to create ephemeral post-CI checkout dir '{}': {e}",
+                    path.display()
+                )
+            })?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for EphemeralCheckoutDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    pub(super) fn resolve_release_target_dir(repo_workspace: &Path) -> PathBuf {
+        if let Some(env_dir) = first_non_empty_env(&["MU_CI_CONTROLLER_RELEASE_TARGET_DIR"]) {
+            return PathBuf::from(env_dir);
+        }
+        repo_workspace.join(".post_ci_target")
+    }
+
+    pub(super) const fn host_elf_arch() -> Option<ExpectedElfArch> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Some(ExpectedElfArch::X86_64)
+        }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            Some(ExpectedElfArch::Aarch64)
+        }
+        #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+        {
+            Some(ExpectedElfArch::Riscv64)
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
+        )))]
+        {
+            None
+        }
+    }
+
+    pub(super) fn cross_target_triple(
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Option<&'static str> {
+        let arch = expected_arch?;
+        if host_elf_arch() == Some(arch) {
+            None
+        } else {
+            Some(arch.target_triple())
+        }
+    }
+
+    fn tail_command_output(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let trimmed = text.trim();
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars.len() <= 1024 {
+            trimmed.to_string()
+        } else {
+            chars[chars.len() - 1024..].iter().collect()
+        }
+    }
+
+    /// Safely unpacks an uncompressed tar stream into `dest_dir`, rejecting symlinks,
+    /// hardlinks, special files, path traversals (`..`), and absolute/prefixed paths.
+    pub(super) fn unpack_tar_bytes_safely(tar_bytes: &[u8], dest_dir: &Path) -> Result<(), String> {
+        let mut archive = Archive::new(std::io::Cursor::new(tar_bytes));
+        let entries = archive
+            .entries()
+            .map_err(|e| format!("Failed reading git archive tar stream: {e}"))?;
+
+        for entry_res in entries {
+            let mut entry =
+                entry_res.map_err(|e| format!("Corrupt entry in git archive tar stream: {e}"))?;
+            let entry_type = entry.header().entry_type();
+            if matches!(
+                entry_type,
+                EntryType::XGlobalHeader
+                    | EntryType::XHeader
+                    | EntryType::GNULongName
+                    | EntryType::GNULongLink
+            ) {
+                continue;
+            }
+            if matches!(entry_type, EntryType::Symlink | EntryType::Link) {
+                return Err("Git archive contains disallowed symlink or hardlink entry".to_string());
+            }
+            if !entry_type.is_file() && !entry_type.is_dir() {
+                return Err(format!(
+                    "Git archive contains disallowed special entry type '{entry_type:?}'"
+                ));
+            }
+
+            let raw_path = entry
+                .path()
+                .map_err(|e| format!("Invalid path in git archive: {e}"))?
+                .into_owned();
+            let mut clean_rel = PathBuf::new();
+            for comp in raw_path.components() {
+                match comp {
+                    Component::Normal(part) => clean_rel.push(part),
+                    Component::CurDir => {}
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                        return Err(format!(
+                            "Git archive contains disallowed traversal or absolute path '{}'",
+                            raw_path.display()
+                        ));
+                    }
+                }
+            }
+            if clean_rel.as_os_str().is_empty() {
+                continue;
+            }
+
+            let out_path = dest_dir.join(&clean_rel);
+            if entry_type.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| {
+                    format!(
+                        "Failed creating unpacked directory '{}': {e}",
+                        out_path.display()
+                    )
+                })?;
+                continue;
+            }
+
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed creating parent directory '{}': {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let mode = entry.header().mode().unwrap_or(0o644);
+            let mut file = std::fs::File::create(&out_path).map_err(|e| {
+                format!(
+                    "Failed creating unpacked file '{}': {e}",
+                    out_path.display()
+                )
+            })?;
+            std::io::copy(&mut entry, &mut file).map_err(|e| {
+                format!("Failed writing unpacked file '{}': {e}", out_path.display())
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if (mode & 0o111) != 0 {
+                    let _ =
+                        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_git_commit_to_dir(
+        repo_workspace: &Path,
+        commit_sha: &str,
+        dest_dir: &Path,
+    ) -> Result<(), String> {
+        let sha = commit_sha.trim();
+        if sha.is_empty()
+            || sha.starts_with('-')
+            || sha.contains('\0')
+            || sha.bytes().any(|b| b.is_ascii_whitespace())
+        {
+            return Err(format!(
+                "Invalid commit_sha '{commit_sha}' for git archive materialization"
+            ));
+        }
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_workspace)
+            .args(["archive", "--format=tar", sha])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|e| {
+                format!(
+                    "Failed spawning git archive for '{}' at '{sha}': {e}",
+                    repo_workspace.display()
+                )
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "git archive failed for '{}' at '{sha}': {}",
+                repo_workspace.display(),
+                tail_command_output(&output.stderr)
+            ));
+        }
+        unpack_tar_bytes_safely(&output.stdout, dest_dir)
+    }
+
+    fn materialize_static_web_bundle(
+        checkout_dir: &Path,
+        target_dir: &Path,
+        summary: &CdManifestSummary,
+    ) -> Result<PackagedArtifact, String> {
+        match resolve_static_web_bundle(checkout_dir, summary) {
+            Ok(pkg) => Ok(pkg),
+            Err(first_err) => {
+                if !checkout_dir.join("Trunk.toml").is_file() {
+                    return Err(first_err);
+                }
+                let out = std::process::Command::new("trunk")
+                    .current_dir(checkout_dir)
+                    .args(["build", "--release"])
+                    .env("CARGO_TARGET_DIR", target_dir)
+                    .env("CARGO_BUILD_JOBS", "2")
+                    .output()
+                    .map_err(|e| {
+                        format!(
+                            "{first_err}; fallback 'trunk build --release' failed to spawn: {e}"
+                        )
+                    })?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "{first_err}; fallback 'trunk build --release' exited {}: {}",
+                        out.status,
+                        tail_command_output(&out.stderr)
+                    ));
+                }
+                resolve_static_web_bundle(checkout_dir, summary)
+            }
+        }
+    }
+
+    fn select_cargo_bin_target(
+        checkout_dir: &Path,
+        candidates: &[String],
+    ) -> (Option<String>, bool) {
+        let Ok(out) = std::process::Command::new("cargo")
+            .current_dir(checkout_dir)
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+        else {
+            return (None, false);
+        };
+        if !out.status.success() {
+            return (None, false);
+        }
+        let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+            return (None, false);
+        };
+        let mut bin_names = Vec::new();
+        if let Some(packages) = meta.get("packages").and_then(|v| v.as_array()) {
+            for pkg in packages {
+                if let Some(targets) = pkg.get("targets").and_then(|v| v.as_array()) {
+                    for target in targets {
+                        let is_bin = target
+                            .get("kind")
+                            .and_then(|k| k.as_array())
+                            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
+                        if is_bin {
+                            if let Some(name) = target.get("name").and_then(|n| n.as_str()) {
+                                bin_names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let matched = candidates
+            .iter()
+            .find(|cand| bin_names.iter().any(|b| b == *cand))
+            .cloned();
+        let is_virtual_workspace = meta
+            .get("resolve")
+            .and_then(|r| r.get("root"))
+            .is_some_and(serde_json::Value::is_null);
+        (matched, is_virtual_workspace)
+    }
+
+    fn build_and_package_rust_binary(
+        checkout_dir: &Path,
+        target_dir: &Path,
+        repo_name: &str,
+        summary: &CdManifestSummary,
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Result<PackagedArtifact, String> {
+        let candidates = candidate_binary_names(summary, repo_name);
+        let (matched_bin, is_virtual_workspace) =
+            select_cargo_bin_target(checkout_dir, &candidates);
+
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.current_dir(checkout_dir)
+            .args(["build", "--release"])
+            .env("CARGO_TARGET_DIR", target_dir)
+            .env("CARGO_BUILD_JOBS", "2");
+        if let Some(triple) = cross_target_triple(expected_arch) {
+            cmd.args(["--target", triple]);
+        }
+        if let Some(bin_name) = matched_bin.as_deref() {
+            cmd.args(["--bin", bin_name]);
+        } else if is_virtual_workspace {
+            cmd.args(["--workspace", "--bins"]);
+        } else {
+            cmd.arg("--bins");
+        }
+
+        let output = cmd.output().map_err(|e| {
+            format!(
+                "Failed spawning cargo build --release in '{}': {e}",
+                checkout_dir.display()
+            )
+        })?;
+        if !output.status.success() {
+            return Err(format!(
+                "cargo build --release failed in '{}' (status {}): {}",
+                checkout_dir.display(),
+                output.status,
+                tail_command_output(&output.stderr)
+            ));
+        }
+
+        resolve_binary_artifact_in_dirs(checkout_dir, target_dir, repo_name, summary)
+    }
+
+    pub(super) fn discover_smoke_test_stems(checkout_dir: &Path) -> Result<Vec<String>, String> {
+        let tests_dir = checkout_dir.join("tests");
+        let Ok(dir_meta) = std::fs::symlink_metadata(&tests_dir) else {
+            return Ok(Vec::new());
+        };
+        if dir_meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing symlink tests directory '{}'",
+                tests_dir.display()
+            ));
+        }
+        if !dir_meta.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries: Vec<_> = std::fs::read_dir(&tests_dir)
+            .map_err(|e| format!("Failed reading '{}': {e}", tests_dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed listing '{}': {e}", tests_dir.display()))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        let mut stems = Vec::new();
+        for entry in entries {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = file_name.strip_suffix(".rs") else {
+                continue;
+            };
+            if !stem.starts_with("smoke_")
+                || stem.len() <= "smoke_".len()
+                || !stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                continue;
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink smoke test source '{}'",
+                    path.display()
+                ));
+            }
+            if meta.is_file() {
+                stems.push(stem.to_string());
+            }
+        }
+        Ok(stems)
+    }
+
+    /// Parses Cargo `--message-format=json` lines to locate the compiled test executable
+    /// for integration test target `stem`.
+    pub(super) fn parse_cargo_test_executable_from_json(
+        stdout: &str,
+        stem: &str,
+    ) -> Option<PathBuf> {
+        let mut found = None;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if val.get("reason").and_then(|v| v.as_str()) != Some("compiler-artifact") {
+                continue;
+            }
+            let is_test_profile = val
+                .get("profile")
+                .and_then(|p| p.get("test"))
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false);
+            if !is_test_profile {
+                continue;
+            }
+            let target_matches = val
+                .get("target")
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+                == Some(stem);
+            if !target_matches {
+                continue;
+            }
+            if let Some(exec) = val
+                .get("executable")
+                .and_then(|e| e.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                found = Some(PathBuf::from(exec));
+            }
+        }
+        found
+    }
+
+    fn maybe_strip_elf_copy(
+        checkout_dir: &Path,
+        stem: &str,
+        orig_path: &Path,
+        orig_bytes: &[u8],
+        expected_arch: Option<ExpectedElfArch>,
+    ) -> Vec<u8> {
+        let Some((_, e_machine)) = parse_elf_machine(orig_bytes) else {
+            return orig_bytes.to_vec();
+        };
+        let strip_candidates: &[&str] = match ExpectedElfArch::from_e_machine(e_machine) {
+            Some(arch) if host_elf_arch() == Some(arch) => &["llvm-strip", "strip"],
+            Some(ExpectedElfArch::Aarch64) => &["llvm-strip", "aarch64-linux-gnu-strip"],
+            Some(ExpectedElfArch::Riscv64) => &["llvm-strip", "riscv64-linux-gnu-strip"],
+            Some(ExpectedElfArch::X86_64) => &["llvm-strip", "x86_64-linux-gnu-strip"],
+            None => return orig_bytes.to_vec(),
+        };
+
+        let out_copy = checkout_dir.join(format!(".post-ci-stripped-{stem}"));
+        for strip_bin in strip_candidates {
+            let _ = std::fs::remove_file(&out_copy);
+            let res = std::process::Command::new(strip_bin)
+                .arg("--strip-all")
+                .arg("-o")
+                .arg(&out_copy)
+                .arg(orig_path)
+                .output();
+            if let Ok(out) = res {
+                if out.status.success() {
+                    if let Ok(stripped) = std::fs::read(&out_copy) {
+                        let _ = std::fs::remove_file(&out_copy);
+                        if !stripped.is_empty()
+                            && stripped.len() <= orig_bytes.len()
+                            && validate_elf_architecture(&stripped, expected_arch, &out_copy)
+                                .is_ok()
+                        {
+                            return stripped;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&out_copy);
+        orig_bytes.to_vec()
+    }
+
+    struct CompiledSmokePackageCtx<'a> {
+        checkout_dir: &'a Path,
+        target_dir: &'a Path,
+        summary: &'a CdManifestSummary,
+        expected_arch: Option<ExpectedElfArch>,
+        commit_sha: &'a str,
+        artifact_sha256: &'a str,
+    }
+
+    fn compile_and_package_smoke_tests(
+        ctx: &CompiledSmokePackageCtx<'_>,
+        stems: &[String],
+    ) -> Result<PackagedArtifact, String> {
+        let mut homogeneous_machine = None;
+        let mut manifest_tests = Vec::with_capacity(stems.len());
+        let mut archive_entries = Vec::with_capacity(stems.len());
+
+        for stem in stems {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.current_dir(ctx.checkout_dir)
+                .args([
+                    "test",
+                    "--release",
+                    "--test",
+                    stem,
+                    "--no-run",
+                    "--message-format=json",
+                ])
+                .env("CARGO_TARGET_DIR", ctx.target_dir)
+                .env("CARGO_BUILD_JOBS", "2");
+            if let Some(triple) = cross_target_triple(ctx.expected_arch) {
+                cmd.args(["--target", triple]);
+            }
+
+            let out = cmd.output().map_err(|e| {
+                format!("Failed spawning cargo test --release --test {stem} --no-run: {e}")
+            })?;
+            if !out.status.success() {
+                return Err(format!(
+                    "cargo test --release --test {stem} --no-run failed ({}): {}",
+                    out.status,
+                    tail_command_output(&out.stderr)
+                ));
+            }
+
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let exec_path =
+                parse_cargo_test_executable_from_json(&stdout, stem).ok_or_else(|| {
+                    format!(
+                        "Cargo JSON output did not report a compiled executable for smoke test '{stem}'"
+                    )
+                })?;
+            let meta = std::fs::symlink_metadata(&exec_path).map_err(|e| {
+                format!(
+                    "Failed to stat compiled smoke binary '{}': {e}",
+                    exec_path.display()
+                )
+            })?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(format!(
+                    "Compiled smoke test output '{}' is not a regular non-symlink file",
+                    exec_path.display()
+                ));
+            }
+            let raw_bytes = std::fs::read(&exec_path).map_err(|e| {
+                format!(
+                    "Failed reading compiled smoke binary '{}': {e}",
+                    exec_path.display()
+                )
+            })?;
+            if raw_bytes.is_empty() {
+                return Err(format!(
+                    "Compiled smoke binary '{}' is empty",
+                    exec_path.display()
+                ));
+            }
+            let bytes = maybe_strip_elf_copy(
+                ctx.checkout_dir,
+                stem,
+                &exec_path,
+                &raw_bytes,
+                ctx.expected_arch,
+            );
+            track_homogeneous_elf(
+                &mut homogeneous_machine,
+                &bytes,
+                ctx.expected_arch,
+                &exec_path,
+            )?;
+
+            let cmd_rel = format!("bin/{stem}");
+            manifest_tests.push(ItManifestEntryJson {
+                name: stem.clone(),
+                command: cmd_rel.clone(),
+                args: Vec::new(),
+                critical: true,
+                timeout_secs: None,
+            });
+            archive_entries.push(ArchivedItEntry {
+                archive_path: PathBuf::from(cmd_rel),
+                bytes,
+                mode: 0o755,
+            });
+        }
+
+        if !is_static_web_deployment(ctx.summary) {
+            for requested in &ctx.summary.integration_tests {
+                let trimmed = requested.trim();
+                if trimmed.starts_with("smoke_") && !stems.iter().any(|s| s == trimmed) {
+                    return Err(format!(
+                        "CD manifest for '{}' requires smoke test '{}', but no matching tests/{}.rs target was found",
+                        ctx.summary.service_name, trimmed, trimmed
+                    ));
+                }
+            }
+        }
+
+        let resolved_arch = ctx
+            .expected_arch
+            .or_else(|| homogeneous_machine.and_then(ExpectedElfArch::from_e_machine));
+
+        let manifest = ItManifestJson {
+            schema_version: 1,
+            service: ctx.summary.service_name.clone(),
+            git_commit: ctx.commit_sha.to_string(),
+            artifact_sha256: ctx.artifact_sha256.to_string(),
+            target_arch: resolved_arch.map(|a| a.label().to_string()),
+            target_triple: resolved_arch.map(|a| a.target_triple().to_string()),
+            tests: manifest_tests,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("Failed to serialize synthesized IT manifest JSON: {e}"))?;
+
+        let mut full_entries = Vec::with_capacity(archive_entries.len() + 1);
+        full_entries.push(ArchivedItEntry {
+            archive_path: PathBuf::from("manifest.json"),
+            bytes: manifest_bytes,
+            mode: 0o644,
+        });
+        full_entries.extend(archive_entries);
+
+        let gz_bytes = build_bounded_tar_gz(&full_entries)?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(PackagedArtifact {
+            filename: format!("{}-it.tar.gz", ctx.summary.service_name),
+            bytes: gz_bytes,
+            sha256_hex,
+        })
+    }
+
+    fn package_it_archive_for_materialized_checkout(
+        ctx: &CompiledSmokePackageCtx<'_>,
+    ) -> Result<PackagedArtifact, String> {
+        const IT_DIR_CANDIDATES: [&str; 6] = [
+            ".mucd/it",
+            ".mucd/tests",
+            ".muconde/it",
+            ".muconde/tests",
+            "tests/it",
+            "it",
+        ];
+        for rel in IT_DIR_CANDIDATES {
+            let dir_path = ctx.checkout_dir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&dir_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink IT directory '{}'",
+                    dir_path.display()
+                ));
+            }
+            if meta.is_dir() {
+                if let Some(pkg) =
+                    package_it_directory(&dir_path, &ctx.summary.service_name, ctx.expected_arch)?
+                {
+                    return Ok(pkg);
+                }
+            }
+        }
+
+        const IT_MANIFEST_FILES: [&str; 3] = [
+            ".mucd/it-manifest.json",
+            ".mucd/manifest.json",
+            "it-manifest.json",
+        ];
+        for rel in IT_MANIFEST_FILES {
+            let file_path = ctx.checkout_dir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&file_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing symlink IT manifest '{}'",
+                    file_path.display()
+                ));
+            }
+            if meta.is_file() {
+                let raw = std::fs::read(&file_path)
+                    .map_err(|e| format!("Failed to read '{}': {e}", file_path.display()))?;
+                return package_it_manifest_file(
+                    ctx.checkout_dir,
+                    &file_path,
+                    &raw,
+                    &ctx.summary.service_name,
+                    ctx.expected_arch,
+                );
+            }
+        }
+
+        let smoke_stems = discover_smoke_test_stems(ctx.checkout_dir)?;
+        if !smoke_stems.is_empty() && ctx.checkout_dir.join("Cargo.toml").is_file() {
+            return compile_and_package_smoke_tests(ctx, &smoke_stems);
+        }
+
+        let selects_custom_smoke = !is_static_web_deployment(ctx.summary)
+            && ctx
+                .summary
+                .integration_tests
+                .iter()
+                .any(|t| t.trim().starts_with("smoke_"));
+        if selects_custom_smoke {
+            return Err(format!(
+                "CD manifest for '{}' selects custom smoke tests {:?}, but no .mucd/it* files or tests/smoke_*.rs targets were found",
+                ctx.summary.service_name, ctx.summary.integration_tests
+            ));
+        }
+
+        tracing::warn!(
+            service = %ctx.summary.service_name,
+            commit = %ctx.commit_sha,
+            workspace = %ctx.checkout_dir.display(),
+            "No .mucd/it* directory, it-manifest.json, or tests/smoke_*.rs targets found; packaging empty IT manifest fallback"
+        );
+
+        let gz_bytes = build_fallback_it_manifest_tar_gz(
+            &ctx.summary.service_name,
+            ctx.commit_sha,
+            ctx.artifact_sha256,
+        )?;
+        let sha256_hex = compute_sha256_hex(&gz_bytes);
+        Ok(PackagedArtifact {
+            filename: format!("{}-it.tar.gz", ctx.summary.service_name),
+            bytes: gz_bytes,
+            sha256_hex,
+        })
+    }
+
+    /// Resolves and packages release + IT artifacts, preserving the prebuilt workspace
+    /// fast path and materializing `--no-checkout` Git workspaces via `git archive`.
+    pub(super) fn package_post_ci_artifacts(
+        repo_workspace: &Path,
+        repo_name: &str,
+        commit_sha: &str,
+        summary: &CdManifestSummary,
+    ) -> Result<(PackagedArtifact, PackagedArtifact), String> {
+        let direct_err = match resolve_and_package_artifact(repo_workspace, repo_name, summary) {
+            Ok(binary) => {
+                let it_archive =
+                    package_it_archive(repo_workspace, summary, commit_sha, &binary.sha256_hex)?;
+                return Ok((binary, it_archive));
+            }
+            Err(err) => err,
+        };
+
+        if !repo_workspace.join(".git").exists() || commit_sha.trim().is_empty() {
+            return Err(direct_err);
+        }
+
+        let ephemeral = EphemeralCheckoutDir::create()?;
+        materialize_git_commit_to_dir(repo_workspace, commit_sha, ephemeral.path())?;
+        let target_dir = resolve_release_target_dir(repo_workspace);
+        let expected_arch = infer_target_arch_from_nodes(&summary.target_nodes);
+
+        let binary = if is_static_web_deployment(summary) {
+            materialize_static_web_bundle(ephemeral.path(), &target_dir, summary)?
+        } else if ephemeral.path().join("Cargo.toml").is_file() {
+            build_and_package_rust_binary(
+                ephemeral.path(),
+                &target_dir,
+                repo_name,
+                summary,
+                expected_arch,
+            )?
+        } else {
+            resolve_binary_artifact(ephemeral.path(), repo_name, summary)
+                .map_err(|_| direct_err.clone())?
+        };
+
+        let smoke_ctx = CompiledSmokePackageCtx {
+            checkout_dir: ephemeral.path(),
+            target_dir: &target_dir,
+            summary,
+            expected_arch,
+            commit_sha,
+            artifact_sha256: &binary.sha256_hex,
+        };
+        let it_archive = package_it_archive_for_materialized_checkout(&smoke_ctx)?;
+        Ok((binary, it_archive))
+    }
+
     pub(super) fn build_cd_http_client(
         tls_ca_path: Option<&str>,
         tls_cert_path: Option<&str>,
@@ -3646,15 +4441,12 @@ pub async fn trigger_post_ci_cd_pipeline_with_config(
     let commit_sha = job.commit_sha.clone();
     let summary_for_pack = summary.clone();
     let packaged = tokio::task::spawn_blocking(move || {
-        let binary =
-            post_ci_cd::resolve_and_package_artifact(&workspace, &repo_name, &summary_for_pack)?;
-        let it_archive = post_ci_cd::package_it_archive(
+        post_ci_cd::package_post_ci_artifacts(
             &workspace,
-            &summary_for_pack,
+            &repo_name,
             &commit_sha,
-            &binary.sha256_hex,
-        )?;
-        Ok::<_, String>((binary, it_archive))
+            &summary_for_pack,
+        )
     })
     .await;
 
@@ -5755,5 +6547,509 @@ on_action:
         let err = post_ci_cd::package_it_archive(dir.path(), &summary, "sha1", &"b".repeat(64))
             .unwrap_err();
         assert!(err.contains("budget"));
+    }
+
+    fn build_raw_tar_with_path(name: &str, typeflag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size_octal = format!("{:011o}\0", payload.len());
+        header[124..136].copy_from_slice(size_octal.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let cksum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        let cksum_octal = format!("{cksum:06o}\0 ");
+        header[148..156].copy_from_slice(cksum_octal.as_bytes());
+
+        let mut tar_bytes = Vec::new();
+        tar_bytes.extend_from_slice(&header);
+        tar_bytes.extend_from_slice(payload);
+        let rem = payload.len() % 512;
+        if rem != 0 {
+            tar_bytes.resize(tar_bytes.len() + (512 - rem), 0);
+        }
+        tar_bytes.extend_from_slice(&[0u8; 1024]);
+        tar_bytes
+    }
+
+    #[test]
+    fn test_unpack_tar_bytes_safely_rejects_symlinks_traversal_and_absolute_paths() {
+        // 1. Valid regular file + PAX global header unpacks cleanly
+        let ok_dir = tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut hdr = tar::Header::new_gnu();
+        let content = b"<html>ok</html>";
+        hdr.set_size(content.len() as u64);
+        hdr.set_mode(0o755);
+        hdr.set_cksum();
+        builder
+            .append_data(&mut hdr, "dist/index.html", &content[..])
+            .unwrap();
+        let valid_tar = builder.into_inner().unwrap();
+        post_ci_cd::unpack_tar_bytes_safely(&valid_tar, ok_dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(ok_dir.path().join("dist/index.html")).unwrap(),
+            content
+        );
+
+        // 2. Symlink entry rejected
+        let sym_dir = tempdir().unwrap();
+        let sym_tar = build_raw_tar_with_path("dist/link", b'2', b"");
+        let sym_err = post_ci_cd::unpack_tar_bytes_safely(&sym_tar, sym_dir.path()).unwrap_err();
+        assert!(sym_err.contains("symlink"), "unexpected error: {sym_err}");
+
+        // 3. Hardlink entry rejected
+        let link_dir = tempdir().unwrap();
+        let link_tar = build_raw_tar_with_path("dist/hard", b'1', b"");
+        let link_err = post_ci_cd::unpack_tar_bytes_safely(&link_tar, link_dir.path()).unwrap_err();
+        assert!(
+            link_err.contains("hardlink"),
+            "unexpected error: {link_err}"
+        );
+
+        // 4. Parent directory traversal (..) rejected
+        let trav_dir = tempdir().unwrap();
+        let trav_tar = build_raw_tar_with_path("../escape.txt", b'0', b"nope");
+        let trav_err = post_ci_cd::unpack_tar_bytes_safely(&trav_tar, trav_dir.path()).unwrap_err();
+        assert!(
+            trav_err.contains("traversal"),
+            "unexpected error: {trav_err}"
+        );
+
+        // 5. Absolute path rejected
+        let abs_dir = tempdir().unwrap();
+        let abs_tar = build_raw_tar_with_path("/etc/escape.txt", b'0', b"nope");
+        let abs_err = post_ci_cd::unpack_tar_bytes_safely(&abs_tar, abs_dir.path()).unwrap_err();
+        assert!(
+            abs_err.contains("absolute") || abs_err.contains("traversal"),
+            "unexpected error: {abs_err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_test_executable_from_json_and_target_dir_helpers() {
+        let sample = r#"
+not-json-line
+{"reason":"compiler-message","message":{"message":"ok"}}
+{"reason":"compiler-artifact","target":{"name":"demo_lib"},"profile":{"test":false},"executable":null}
+{"reason":"compiler-artifact","target":{"name":"smoke_other"},"profile":{"test":true},"executable":"/tmp/target/release/deps/smoke_other-1111111111111111"}
+{"reason":"compiler-artifact","target":{"name":"smoke_demo"},"profile":{"test":false},"executable":"/tmp/target/release/smoke_demo"}
+{"reason":"compiler-artifact","target":{"name":"smoke_demo"},"profile":{"test":true},"executable":"/tmp/target/release/deps/smoke_demo-0123456789abcdef"}
+"#;
+        assert_eq!(
+            post_ci_cd::parse_cargo_test_executable_from_json(sample, "smoke_demo"),
+            Some(std::path::PathBuf::from(
+                "/tmp/target/release/deps/smoke_demo-0123456789abcdef"
+            ))
+        );
+        assert_eq!(
+            post_ci_cd::parse_cargo_test_executable_from_json(sample, "smoke_missing"),
+            None
+        );
+        assert_eq!(post_ci_cd::cross_target_triple(None), None);
+        if std::env::var("MU_CI_CONTROLLER_RELEASE_TARGET_DIR")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            assert_eq!(
+                post_ci_cd::resolve_release_target_dir(Path::new("/tmp/ws")),
+                std::path::PathBuf::from("/tmp/ws/.post_ci_target")
+            );
+        }
+    }
+
+    fn run_isolated_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn isolated git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    type MockMultipartPartsMap = HashMap<String, (Option<String>, Vec<u8>)>;
+    type MockCapturedRegCall = (String, MockMultipartPartsMap);
+    type MockCapturedDeployCall = (String, String, serde_json::Value);
+
+    async fn spawn_mock_post_ci_registry_and_cd_server(
+        bundle_id: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<MockCapturedRegCall>>>,
+        Arc<std::sync::Mutex<Vec<MockCapturedDeployCall>>>,
+    ) {
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Json, Router};
+
+        let captured_reg: Arc<std::sync::Mutex<Vec<MockCapturedRegCall>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_deploy: Arc<std::sync::Mutex<Vec<MockCapturedDeployCall>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/bundles/it",
+                post({
+                    let cap = captured_reg.clone();
+                    move |headers: HeaderMap, body: Bytes| {
+                        let cap = cap.clone();
+                        async move {
+                            let content_type = headers
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let traceparent = headers
+                                .get("traceparent")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let parts = parse_multipart_parts(&content_type, &body);
+                            let service_name = String::from_utf8(
+                                parts.get("service_name").expect("service_name").1.clone(),
+                            )
+                            .unwrap();
+                            let binary_digest = post_ci_cd::compute_sha256_hex(
+                                &parts.get("binary").expect("binary").1,
+                            );
+                            let it_archive_digest = post_ci_cd::compute_sha256_hex(
+                                &parts.get("it_archive").expect("it_archive").1,
+                            );
+                            cap.lock().unwrap().push((traceparent, parts));
+                            (
+                                axum::http::StatusCode::CREATED,
+                                Json(serde_json::json!({
+                                    "bundle_id": bundle_id,
+                                    "service_name": service_name,
+                                    "binary_digest": binary_digest,
+                                    "it_archive_digest": it_archive_digest,
+                                    "status": "pending_it",
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/cd/deploy",
+                post({
+                    let cap = captured_deploy.clone();
+                    move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let cap = cap.clone();
+                        async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let tp = headers
+                                .get("traceparent")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            cap.lock().unwrap().push((auth, tp, body));
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), captured_reg, captured_deploy)
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_no_checkout_static_dist_materialization() {
+        let root = tempdir().unwrap();
+        let src_repo = root.path().join("src-web");
+        std::fs::create_dir_all(src_repo.join(".mucd")).unwrap();
+        std::fs::create_dir_all(src_repo.join("dist")).unwrap();
+        std::fs::write(
+            src_repo.join(".mucd/mu-cd.yml"),
+            "version: \"1\"\nservice: \"mu-ci-web\"\ntarget_nodes:\n  - \"node-a\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("dist/index.html"),
+            b"<html>no-checkout-web</html>",
+        )
+        .unwrap();
+        std::fs::write(src_repo.join("dist/app.wasm"), b"\x00asm\x01\x00\x00\x00").unwrap();
+
+        run_isolated_git(&src_repo, &["init", "-b", "main"]);
+        run_isolated_git(&src_repo, &["config", "user.name", "CI Test"]);
+        run_isolated_git(&src_repo, &["config", "user.email", "ci@example.invalid"]);
+        run_isolated_git(&src_repo, &["add", "."]);
+        run_isolated_git(&src_repo, &["commit", "-m", "initial web dist"]);
+        let sha = run_isolated_git(&src_repo, &["rev-parse", "HEAD"]);
+
+        let no_checkout_ws = root.path().join("no-checkout-web");
+        let clone_out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args([
+                "clone",
+                "--no-checkout",
+                src_repo.to_str().unwrap(),
+                no_checkout_ws.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone_out.status.success());
+        assert!(no_checkout_ws.join(".git").exists());
+        assert!(!no_checkout_ws.join("dist").exists());
+
+        let (base_url, captured_reg, captured_deploy) =
+            spawn_mock_post_ci_registry_and_cd_server("bundle-no-checkout-web").await;
+
+        let job = Job {
+            id: "job-no-checkout-web".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-web".to_string(),
+            clone_url: src_repo.display().to_string(),
+            commit_sha: sha.clone(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        let ok = trigger_post_ci_cd_pipeline_with_endpoints(
+            &job,
+            &no_checkout_ws,
+            Some(&base_url),
+            Some(&base_url),
+            Some("test-cd-token"),
+        )
+        .await;
+        assert!(
+            ok,
+            "expected --no-checkout static dist packaging to succeed"
+        );
+
+        let reg_calls = captured_reg.lock().unwrap().clone();
+        assert_eq!(reg_calls.len(), 1);
+        let parts = &reg_calls[0].1;
+        assert_eq!(parts["service_name"].1, b"mu-ci-web");
+        let bin_sha = post_ci_cd::compute_sha256_hex(&parts["binary"].1);
+        let it_sha = post_ci_cd::compute_sha256_hex(&parts["it_archive"].1);
+
+        let mut tar_entries = Vec::new();
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(parts["binary"].1.as_slice()));
+        for entry in archive.entries().unwrap() {
+            tar_entries.push(entry.unwrap().path().unwrap().display().to_string());
+        }
+        assert!(tar_entries.contains(&"dist/index.html".to_string()));
+        assert!(tar_entries.contains(&"dist/app.wasm".to_string()));
+
+        let deploy_calls = captured_deploy.lock().unwrap().clone();
+        assert_eq!(deploy_calls.len(), 1);
+        let body = &deploy_calls[0].2;
+        assert_eq!(body["repo"], "LMA1980/mu-ci-web");
+        assert_eq!(body["service"], "mu-ci-web");
+        assert_eq!(body["git_commit"], sha);
+        assert_eq!(body["binary_digest"], bin_sha);
+        assert_eq!(body["it_archive_digest"], it_sha);
+        assert_eq!(body["bundle_id"], "bundle-no-checkout-web");
+        assert_eq!(body["wait"], false);
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "binary_digest",
+                "bundle_id",
+                "git_commit",
+                "it_archive_digest",
+                "repo",
+                "service",
+                "wait",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_no_checkout_rust_binary_and_smoke_it() {
+        use std::collections::BTreeMap;
+        use std::io::Read as _;
+
+        let root = tempdir().unwrap();
+        let src_repo = root.path().join("src-rust");
+        std::fs::create_dir_all(src_repo.join(".mucd")).unwrap();
+        std::fs::create_dir_all(src_repo.join("src")).unwrap();
+        std::fs::create_dir_all(src_repo.join("tests")).unwrap();
+        std::fs::write(
+            src_repo.join(".mucd/mu-cd.yml"),
+            "version: \"1\"\nservice: \"demo-svc\"\ntarget_nodes:\n  - \"node-a\"\nintegration_tests:\n  - \"smoke_demo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("Cargo.toml"),
+            "[package]\nname = \"demo-svc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("src/main.rs"),
+            "fn main() {\n    println!(\"demo-svc ok\");\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("tests/smoke_demo.rs"),
+            "#[test]\nfn smoke_ok() {\n    assert_eq!(2 + 2, 4);\n}\n",
+        )
+        .unwrap();
+
+        run_isolated_git(&src_repo, &["init", "-b", "main"]);
+        run_isolated_git(&src_repo, &["config", "user.name", "CI Test"]);
+        run_isolated_git(&src_repo, &["config", "user.email", "ci@example.invalid"]);
+        run_isolated_git(&src_repo, &["add", "."]);
+        run_isolated_git(&src_repo, &["commit", "-m", "initial demo-svc"]);
+        let sha = run_isolated_git(&src_repo, &["rev-parse", "HEAD"]);
+
+        let no_checkout_ws = root.path().join("no-checkout-rust");
+        let clone_out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args([
+                "clone",
+                "--no-checkout",
+                src_repo.to_str().unwrap(),
+                no_checkout_ws.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone_out.status.success());
+        assert!(no_checkout_ws.join(".git").exists());
+        assert!(!no_checkout_ws.join("Cargo.toml").exists());
+        assert!(!no_checkout_ws.join("target").exists());
+
+        let (base_url, captured_reg, captured_deploy) =
+            spawn_mock_post_ci_registry_and_cd_server("bundle-no-checkout-rust").await;
+
+        let job = Job {
+            id: "job-no-checkout-rust".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/demo-svc".to_string(),
+            clone_url: src_repo.display().to_string(),
+            commit_sha: sha.clone(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        let ok = trigger_post_ci_cd_pipeline_with_endpoints(
+            &job,
+            &no_checkout_ws,
+            Some(&base_url),
+            Some(&base_url),
+            Some("test-cd-token"),
+        )
+        .await;
+        assert!(
+            ok,
+            "expected --no-checkout Rust release binary + smoke_demo packaging to succeed"
+        );
+
+        let reg_calls = captured_reg.lock().unwrap().clone();
+        assert_eq!(reg_calls.len(), 1);
+        let parts = &reg_calls[0].1;
+        assert_eq!(parts["service_name"].1, b"demo-svc");
+        assert_eq!(parts["binary"].0.as_deref(), Some("demo-svc"));
+        assert!(!parts["binary"].1.is_empty());
+        let bin_sha = post_ci_cd::compute_sha256_hex(&parts["binary"].1);
+        let it_sha = post_ci_cd::compute_sha256_hex(&parts["it_archive"].1);
+
+        let mut it_entries: BTreeMap<String, (u32, Vec<u8>)> = BTreeMap::new();
+        let mut it_archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            parts["it_archive"].1.as_slice(),
+        ));
+        for entry in it_archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let path = e.path().unwrap().display().to_string();
+            let mode = e.header().mode().unwrap() & 0o777;
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            it_entries.insert(path, (mode, buf));
+        }
+
+        assert_eq!(it_entries.len(), 2);
+        let (manifest_mode, manifest_bytes) = it_entries.get("manifest.json").unwrap();
+        assert_eq!(*manifest_mode, 0o644);
+        let manifest: post_ci_cd::ItManifestJson = serde_json::from_slice(manifest_bytes).unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.service, "demo-svc");
+        assert_eq!(manifest.git_commit, sha);
+        assert_eq!(manifest.artifact_sha256, bin_sha);
+        assert_eq!(manifest.tests.len(), 1);
+        assert_eq!(manifest.tests[0].name, "smoke_demo");
+        assert_eq!(manifest.tests[0].command, "bin/smoke_demo");
+        assert!(manifest.tests[0].args.is_empty());
+        assert!(manifest.tests[0].critical);
+
+        let (smoke_mode, smoke_bytes) = it_entries.get("bin/smoke_demo").unwrap();
+        assert_eq!(*smoke_mode, 0o755);
+        assert!(!smoke_bytes.is_empty());
+
+        let deploy_calls = captured_deploy.lock().unwrap().clone();
+        assert_eq!(deploy_calls.len(), 1);
+        let body = &deploy_calls[0].2;
+        assert_eq!(body["repo"], "LMA1980/demo-svc");
+        assert_eq!(body["service"], "demo-svc");
+        assert_eq!(body["git_commit"], sha);
+        assert_eq!(body["binary_digest"], bin_sha);
+        assert_eq!(body["it_archive_digest"], it_sha);
+        assert_eq!(body["bundle_id"], "bundle-no-checkout-rust");
+        assert_eq!(body["wait"], false);
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "binary_digest",
+                "bundle_id",
+                "git_commit",
+                "it_archive_digest",
+                "repo",
+                "service",
+                "wait",
+            ]
+        );
     }
 }
