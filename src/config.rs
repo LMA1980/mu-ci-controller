@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Configured High-Availability role policy for a controller instance (`#78`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -61,7 +62,7 @@ impl HaRole {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub workspace_dir: PathBuf,
@@ -70,6 +71,9 @@ pub struct Config {
     pub allow_fork_prs: bool,
     pub allowed_pr_authors: Vec<String>,
     pub log_api_key: Option<String>,
+    /// Optional dedicated read-only service bearer token for least-privilege
+    /// inspection probes (resolved strictly fail-closed from a file path).
+    pub readonly_api_token: Option<String>,
     pub webhook_secret: Option<String>,
     pub cluster_token: String,
     pub job_timeout_seconds: u64,
@@ -99,6 +103,62 @@ pub struct Config {
     pub host_elevation_secret: Option<String>,
     /// Optional explicit path for persistent platform auth state JSON.
     pub auth_state_file: Option<PathBuf>,
+}
+
+fn redacted_opt(opt: &Option<String>) -> &'static str {
+    if opt.is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("workspace_dir", &self.workspace_dir)
+            .field("allowed_repositories", &self.allowed_repositories)
+            .field("allowed_actors", &self.allowed_actors)
+            .field("allow_fork_prs", &self.allow_fork_prs)
+            .field("allowed_pr_authors", &self.allowed_pr_authors)
+            .field("log_api_key", &redacted_opt(&self.log_api_key))
+            .field(
+                "readonly_api_token",
+                &redacted_opt(&self.readonly_api_token),
+            )
+            .field("webhook_secret", &redacted_opt(&self.webhook_secret))
+            .field("cluster_token", &"<redacted>")
+            .field("job_timeout_seconds", &self.job_timeout_seconds)
+            .field("allow_insecure_no_secret", &self.allow_insecure_no_secret)
+            .field("max_concurrent_jobs", &self.max_concurrent_jobs)
+            .field("github_token", &redacted_opt(&self.github_token))
+            .field("node_id", &self.node_id)
+            .field("ha_role", &self.ha_role)
+            .field("lease_ttl_seconds", &self.lease_ttl_seconds)
+            .field("standby_sync_seconds", &self.standby_sync_seconds)
+            .field("proxy_secret", &redacted_opt(&self.proxy_secret))
+            .field(
+                "invite_signing_key",
+                &redacted_opt(&self.invite_signing_key),
+            )
+            .field("bootstrap_admins", &self.bootstrap_admins)
+            .field("quic_bind_addr", &self.quic_bind_addr)
+            .field("quic_alt_svc_port", &self.quic_alt_svc_port)
+            .field("quic_alt_svc_max_age", &self.quic_alt_svc_max_age)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("tls_ca_path", &self.tls_ca_path)
+            .field("webauthn_rp_id", &self.webauthn_rp_id)
+            .field("webauthn_rp_name", &self.webauthn_rp_name)
+            .field("webauthn_rp_origin", &self.webauthn_rp_origin)
+            .field(
+                "host_elevation_secret",
+                &redacted_opt(&self.host_elevation_secret),
+            )
+            .field("auth_state_file", &self.auth_state_file)
+            .finish()
+    }
 }
 
 /// Returns the first non-empty trimmed value among `vars` using a custom env lookup.
@@ -160,6 +220,7 @@ impl Default for Config {
                 "COLLABORATOR".to_string(),
             ],
             log_api_key: None,
+            readonly_api_token: None,
             webhook_secret: None,
             cluster_token: "actionrunner_default_cluster_token".to_string(),
             job_timeout_seconds: 1800,
@@ -277,6 +338,14 @@ impl Config {
 
         let log_api_key = Self::resolve_secret_first_with_env(
             &["MU_CI_CONTROLLER_LOG_API_KEY", "ACTION_RUNNER_LOG_API_KEY"],
+            &get_env,
+        );
+
+        let readonly_api_token = Self::resolve_strict_token_file_first_with_env(
+            &[
+                "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                "MU_CI_READONLY_TOKEN_FILE",
+            ],
             &get_env,
         );
 
@@ -437,6 +506,7 @@ impl Config {
             allow_fork_prs,
             allowed_pr_authors,
             log_api_key,
+            readonly_api_token,
             webhook_secret,
             cluster_token,
             job_timeout_seconds,
@@ -641,6 +711,82 @@ impl Config {
             }
             Err(err) => {
                 warn!("Failed to read secret file at {}: {}", path.display(), err);
+                None
+            }
+        }
+    }
+
+    /// Resolves a secret strictly from the first configured file-path environment variable in
+    /// `vars`. Never falls back to treating the environment variable value as a literal token,
+    /// and fails closed (`None`) with an `error!` log if the configured file path is empty,
+    /// missing, unreadable, not a regular file, or empty after trimming.
+    pub fn resolve_strict_token_file_first_with_env<F>(vars: &[&str], get_env: F) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut saw_empty_var: Option<&str> = None;
+        for var in vars {
+            if let Some(raw_path) = get_env(var) {
+                let trimmed = raw_path.trim();
+                if trimmed.is_empty() {
+                    saw_empty_var.get_or_insert(var);
+                    continue;
+                }
+                return Self::resolve_strict_token_file(var, trimmed);
+            }
+        }
+        if let Some(var) = saw_empty_var {
+            error!(
+                env_var = var,
+                "Configured read-only service token file path is empty; failing closed"
+            );
+        }
+        None
+    }
+
+    /// Reads and trims a token strictly from `path_str`, failing closed (`None`) with an `error!`
+    /// log if the path is empty, missing, non-regular, unreadable, or empty after trimming.
+    /// Never logs the token value or falls back to returning `path_str`.
+    pub fn resolve_strict_token_file(env_var: &str, path_str: &str) -> Option<String> {
+        let trimmed = path_str.trim();
+        if trimmed.is_empty() {
+            error!(
+                env_var = env_var,
+                "Configured read-only service token file path is empty; failing closed"
+            );
+            return None;
+        }
+        let path = Path::new(trimmed);
+        if !path.is_file() {
+            error!(
+                env_var = env_var,
+                "Configured read-only service token file does not exist or is not a regular file; failing closed"
+            );
+            return None;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let secret = content.trim().to_string();
+                if secret.is_empty() {
+                    error!(
+                        env_var = env_var,
+                        "Configured read-only service token file is empty; failing closed"
+                    );
+                    None
+                } else {
+                    info!(
+                        env_var = env_var,
+                        "Loaded read-only service bearer token from configured file"
+                    );
+                    Some(secret)
+                }
+            }
+            Err(err) => {
+                error!(
+                    env_var = env_var,
+                    error_kind = ?err.kind(),
+                    "Failed to read configured read-only service token file; failing closed"
+                );
                 None
             }
         }
@@ -1140,5 +1286,255 @@ mod tests {
         std::env::set_var(test_keys[0], "88");
         assert_eq!(first_non_empty_env(&test_keys).as_deref(), Some("88"));
         assert_eq!(first_parsed_env::<usize>(&test_keys), Some(88));
+    }
+
+    #[test]
+    fn test_readonly_api_token_precedence_and_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_file = dir.path().join("primary-ro.token");
+        let fallback_file = dir.path().join("fallback-ro.token");
+        std::fs::write(&primary_file, "  primary-ro-secret-token \r\n\t").unwrap();
+        std::fs::write(&fallback_file, "\n  fallback-ro-secret-token  \n").unwrap();
+
+        // Unset -> None
+        let empty_cfg = Config::load_with_env(|_| None);
+        assert_eq!(empty_cfg.readonly_api_token, None);
+
+        // Fallback MU_CI_READONLY_TOKEN_FILE used when primary unset
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+        env_map.insert(
+            "MU_CI_READONLY_TOKEN_FILE",
+            fallback_file.to_str().unwrap().to_string(),
+        );
+        let fallback_cfg = Config::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(
+            fallback_cfg.readonly_api_token.as_deref(),
+            Some("fallback-ro-secret-token")
+        );
+
+        // Canonical MU_CI_CONTROLLER_READONLY_TOKEN_FILE overrides MU_CI_READONLY_TOKEN_FILE
+        env_map.insert(
+            "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+            primary_file.to_str().unwrap().to_string(),
+        );
+        let primary_cfg = Config::load_with_env(|k| env_map.get(k).cloned());
+        assert_eq!(
+            primary_cfg.readonly_api_token.as_deref(),
+            Some("primary-ro-secret-token")
+        );
+    }
+
+    #[test]
+    fn test_readonly_api_token_fail_closed_missing_empty_dir_and_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid_file = dir.path().join("valid-ro.token");
+        let empty_file = dir.path().join("empty-ro.token");
+        std::fs::write(&valid_file, "valid-fallback-token\n").unwrap();
+        std::fs::write(&empty_file, "   \n\t  ").unwrap();
+
+        // 1. Missing primary file fails closed even when fallback is valid
+        let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+        env_map.insert(
+            "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+            "/nonexistent/path/to/ci-readonly.token".to_string(),
+        );
+        env_map.insert(
+            "MU_CI_READONLY_TOKEN_FILE",
+            valid_file.to_str().unwrap().to_string(),
+        );
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None,
+            "Missing primary read-only token file must fail closed without falling back"
+        );
+
+        // 2. Empty file fails closed
+        env_map.insert(
+            "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+            empty_file.to_str().unwrap().to_string(),
+        );
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None,
+            "Empty read-only token file must fail closed"
+        );
+
+        // 3. Directory path fails closed
+        env_map.insert(
+            "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+            dir.path().to_str().unwrap().to_string(),
+        );
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None,
+            "Directory path must fail closed"
+        );
+
+        // 4. Literal token value (not a file path) must NEVER be accepted as a literal secret
+        env_map.insert(
+            "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+            "literal-secret-that-must-not-load".to_string(),
+        );
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None,
+            "Non-file literal value in *_READONLY_TOKEN_FILE must fail closed"
+        );
+
+        // 5. Fallback missing file & empty env var both fail closed
+        env_map.clear();
+        env_map.insert(
+            "MU_CI_READONLY_TOKEN_FILE",
+            "/nonexistent/fallback-readonly.token".to_string(),
+        );
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None
+        );
+
+        env_map.clear();
+        env_map.insert("MU_CI_CONTROLLER_READONLY_TOKEN_FILE", "   ".to_string());
+        assert_eq!(
+            Config::load_with_env(|k| env_map.get(k).cloned()).readonly_api_token,
+            None
+        );
+
+        // 6. Unreadable file (0o000) fails closed when not running as root
+        #[cfg(all(unix, not(miri)))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = dir.path().join("unreadable-ro.token");
+            std::fs::write(&unreadable, "unreadable-secret\n").unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let res = Config::resolve_strict_token_file(
+                "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                unreadable.to_str().unwrap(),
+            );
+            // Restore permissions so tempdir cleanup always succeeds
+            let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600));
+            // Only assert None when the OS actually enforced 0o000 (non-root)
+            if std::fs::OpenOptions::new()
+                .read(true)
+                .open(&unreadable)
+                .is_ok()
+            {
+                // Re-check with 0o000 probe to determine if running unprivileged
+                let _ =
+                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000));
+                let readable_as_000 = std::fs::read_to_string(&unreadable).is_ok();
+                let _ =
+                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600));
+                if !readable_as_000 {
+                    assert_eq!(res, None, "Unreadable 0o000 token file must fail closed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_readonly_api_token_error_logging_and_zero_leakage() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret_val = "ro_super_secret_token_9f8e7d6c5b4a";
+        let admin_val = "admin_super_secret_key_1a2b3c4d5e";
+        let literal_val = "accidental_literal_secret_must_not_log";
+        let valid_file = dir.path().join("ro.token");
+        let empty_file = dir.path().join("empty.token");
+        std::fs::write(&valid_file, format!("{secret_val}\n")).unwrap();
+        std::fs::write(&empty_file, "  \n").unwrap();
+
+        let shared_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_handle = Arc::clone(&shared_buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || BufWriter(Arc::clone(&writer_handle)))
+            .finish();
+
+        let loaded_cfg = tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                Config::resolve_strict_token_file(
+                    "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                    "/nonexistent/missing-ro.token"
+                ),
+                None
+            );
+            assert_eq!(
+                Config::resolve_strict_token_file(
+                    "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                    empty_file.to_str().unwrap()
+                ),
+                None
+            );
+            assert_eq!(
+                Config::resolve_strict_token_file(
+                    "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                    literal_val
+                ),
+                None
+            );
+            assert_eq!(
+                Config::resolve_strict_token_file_first_with_env(
+                    &["MU_CI_CONTROLLER_READONLY_TOKEN_FILE"],
+                    |_| Some("   ".to_string())
+                ),
+                None
+            );
+
+            let mut env_map: std::collections::HashMap<&str, String> = Default::default();
+            env_map.insert("MU_CI_CONTROLLER_LOG_API_KEY", admin_val.to_string());
+            env_map.insert(
+                "MU_CI_CONTROLLER_READONLY_TOKEN_FILE",
+                valid_file.to_str().unwrap().to_string(),
+            );
+            Config::load_with_env(|k| env_map.get(k).cloned())
+        });
+
+        assert_eq!(loaded_cfg.readonly_api_token.as_deref(), Some(secret_val));
+        assert_eq!(loaded_cfg.log_api_key.as_deref(), Some(admin_val));
+
+        let logs = String::from_utf8(shared_buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ERROR") && logs.contains("failing closed"),
+            "Expected fail-closed ERROR logs, got: {logs}"
+        );
+        assert!(
+            !logs.contains(secret_val),
+            "Read-only token leaked into tracing logs: {logs}"
+        );
+        assert!(
+            !logs.contains(literal_val),
+            "Accidental literal value leaked into tracing logs: {logs}"
+        );
+        assert!(
+            !logs.contains(admin_val),
+            "Admin log API key leaked into tracing logs: {logs}"
+        );
+
+        let debug_repr = format!("{loaded_cfg:?}");
+        assert!(debug_repr.contains("<redacted>"));
+        assert!(
+            !debug_repr.contains(secret_val),
+            "Read-only token leaked into Config Debug output"
+        );
+        assert!(
+            !debug_repr.contains(admin_val),
+            "Admin log API key leaked into Config Debug output"
+        );
     }
 }

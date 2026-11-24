@@ -49,6 +49,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("GitHub Webhook HMAC signature verification: STRICT (incoming webhooks will be rejected until GITHUB_WEBHOOK_SECRET is set)");
     }
 
+    if config.readonly_api_token.is_some() {
+        info!("Dedicated read-only service bearer token slot: ACTIVE");
+    }
+    if let (Some(admin), Some(ro)) = (&config.log_api_key, &config.readonly_api_token) {
+        if mu_ci_controller::console::platform_auth::constant_time_eq(
+            admin.as_bytes(),
+            ro.as_bytes(),
+        ) {
+            warn!(
+                "Read-only service token matches admin log API key; configure distinct secrets for least-privilege isolation"
+            );
+        }
+    }
+
     let job_store = JobStore::from_config(100, &config);
     info!(
         node_id = %config.node_id,

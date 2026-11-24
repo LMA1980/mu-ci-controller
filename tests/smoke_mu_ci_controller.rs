@@ -339,6 +339,7 @@ async fn smoke_mu_ci_controller_endpoints_and_auth() {
 
     let tmp_ws = tempdir().unwrap();
     let api_key = "ephemeral-controller-smoke-key".to_string();
+    let readonly_token = "ephemeral-controller-readonly-token".to_string();
     let config = Config {
         bind_addr: "127.0.0.1:0".to_string(),
         workspace_dir: tmp_ws.path().to_path_buf(),
@@ -347,6 +348,7 @@ async fn smoke_mu_ci_controller_endpoints_and_auth() {
         allow_fork_prs: false,
         allowed_pr_authors: vec!["OWNER".to_string()],
         log_api_key: Some(api_key.clone()),
+        readonly_api_token: Some(readonly_token.clone()),
         webhook_secret: None,
         cluster_token: "ephemeral-cluster-token".to_string(),
         job_timeout_seconds: 30,
@@ -398,7 +400,25 @@ async fn smoke_mu_ci_controller_endpoints_and_auth() {
             .await;
     });
 
-    run_controller_readonly_checks(&client, &format!("http://{addr}"), Some(&api_key), true).await;
+    run_controller_readonly_checks(
+        &client,
+        &format!("http://{addr}"),
+        Some(&readonly_token),
+        true,
+    )
+    .await;
+
+    let mutating_resp = client
+        .post(format!("http://{addr}/api/ha/promote"))
+        .bearer_auth(&readonly_token)
+        .send()
+        .await
+        .expect("POST /api/ha/promote with RO token must connect");
+    assert_eq!(
+        mutating_resp.status(),
+        403,
+        "Dedicated read-only token must receive 403 Forbidden on mutating routes"
+    );
 
     let _ = stop_tx.send(());
     let _ = srv_task.await;
