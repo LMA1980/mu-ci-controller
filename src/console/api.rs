@@ -45,6 +45,8 @@ const HISTORY_LIMIT: usize = 20;
 pub enum AuthResolution {
     /// Request presents a valid `Authorization: Bearer <log_api_key>` or `X-Api-Key: <log_api_key>`.
     AdminApiKey,
+    /// Request presents a valid dedicated read-only service bearer token.
+    ReadOnlyServiceToken,
     /// Request presents a valid `X-Proxy-Secret` + `X-Forwarded-User` whose login is active and `revoked == 0`.
     BoundUser { github_login: String, role: String },
     /// Request presents a valid `X-Proxy-Secret` + `X-Forwarded-User`, but the login is not bound or is revoked.
@@ -56,7 +58,10 @@ pub enum AuthResolution {
 impl AuthResolution {
     #[must_use]
     pub const fn is_authenticated(&self) -> bool {
-        matches!(self, Self::AdminApiKey | Self::BoundUser { .. })
+        matches!(
+            self,
+            Self::AdminApiKey | Self::ReadOnlyServiceToken | Self::BoundUser { .. }
+        )
     }
 
     #[must_use]
@@ -64,30 +69,20 @@ impl AuthResolution {
         match self {
             Self::AdminApiKey => true,
             Self::BoundUser { role, .. } => role == "admin" || role == "platform-admin",
-            Self::UninvitedUser { .. } | Self::Anonymous => false,
+            Self::ReadOnlyServiceToken | Self::UninvitedUser { .. } | Self::Anonymous => false,
         }
     }
 }
 
-/// `true` when the request presents the configured controller API key. With no key
-/// configured nobody is authenticated (fail closed).
+/// `true` when the request presents a configured controller service token
+/// (`log_api_key` or `readonly_api_token`). With no key configured nobody is authenticated (fail closed).
 #[must_use]
 pub fn is_authenticated(config: &Config, headers: &HeaderMap) -> bool {
-    let Some(required) = config.log_api_key.as_deref() else {
-        return false;
-    };
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
-    let api_key = headers.get("x-api-key").and_then(|h| h.to_str().ok());
-    [bearer, api_key]
-        .into_iter()
-        .flatten()
-        .any(|presented| constant_time_eq(presented.trim().as_bytes(), required.as_bytes()))
+    super::platform_auth::has_valid_admin_api_key(config, headers, None)
+        || super::platform_auth::has_valid_readonly_api_token(config, headers, None)
 }
 
-/// Resolves operator identity across `AdminApiKey`, `BoundUser`, `UninvitedUser`, and `Anonymous` (`#95`).
+/// Resolves operator identity across `AdminApiKey`, `ReadOnlyServiceToken`, `BoundUser`, `UninvitedUser`, and `Anonymous` (`#95`).
 #[must_use]
 pub fn resolve_auth(config: &Config, job_store: &JobStore, headers: &HeaderMap) -> AuthResolution {
     resolve_auth_with_query_key(config, job_store, headers, None)
@@ -105,6 +100,9 @@ pub fn resolve_auth_with_query_key(
         super::platform_auth::EvaluatedRequestAuth::evaluate(config, job_store, headers, query_key);
     if eval.is_admin_api_key {
         return AuthResolution::AdminApiKey;
+    }
+    if eval.is_readonly_api_token {
+        return AuthResolution::ReadOnlyServiceToken;
     }
     if eval.is_uninvited {
         return AuthResolution::UninvitedUser {
@@ -177,10 +175,7 @@ pub fn verify_invite_token<'a>(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    super::platform_auth::constant_time_eq(a, b)
 }
 
 // ============================================================================
@@ -904,7 +899,7 @@ fn require_repo_admin(state: &AppState, headers: &HeaderMap) -> Option<Response>
     if eval.is_admin_api_key {
         return None;
     }
-    if eval.is_uninvited {
+    if eval.is_readonly_api_token || eval.is_uninvited {
         return Some(super::platform_auth::authorization_denied_response());
     }
     if eval.passkey_enrollment_required {

@@ -1,6 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
@@ -336,7 +338,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_branch_submodule_card),
         )
         .route("/", get(health_check))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_readonly_service_token_scope,
+        ));
 
     let alt_svc_port = state.config.quic_alt_svc_port.or_else(|| {
         state
@@ -355,6 +361,81 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     } else {
         router
     }
+}
+
+fn extract_query_api_key(query: Option<&str>) -> Option<String> {
+    let raw = query?;
+    let mut fallback_token: Option<String> = None;
+    for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if k == "api_key" {
+            return Some(trimmed.to_string());
+        }
+        if k == "token" && fallback_token.is_none() {
+            fallback_token = Some(trimmed.to_string());
+        }
+    }
+    fallback_token
+}
+
+fn is_readonly_token_route_allowed(method: &Method, path: &str) -> bool {
+    if method != Method::GET && method != Method::HEAD {
+        return false;
+    }
+    if path.contains("..") || path.contains("//") {
+        return false;
+    }
+    let normalized = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+    matches!(
+        normalized,
+        "/" | "/health"
+            | "/api/health"
+            | "/ha/status"
+            | "/api/ha/status"
+            | "/api/cluster/nodes"
+            | "/cluster/status"
+            | "/api/cluster/status"
+            | "/queue"
+            | "/api/queue"
+            | "/api/ci/queue"
+            | "/events"
+            | "/api/events"
+            | "/jobs"
+            | "/api/jobs"
+            | "/api/repos"
+            | "/api/auth/folios"
+            | "/api/auth/session"
+    ) || normalized.starts_with("/jobs/")
+        || normalized.starts_with("/api/jobs/")
+        || normalized.starts_with("/api/repos/")
+        || normalized.starts_with("/badges/")
+        || normalized.starts_with("/cards/")
+}
+
+async fn enforce_readonly_service_token_scope(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let query_key = extract_query_api_key(req.uri().query());
+    let query_key_ref = query_key.as_deref();
+    if crate::console::platform_auth::resolve_service_token_tier(
+        &state.config,
+        req.headers(),
+        query_key_ref,
+    ) == crate::console::platform_auth::ServiceTokenTier::ReadOnly
+        && !is_readonly_token_route_allowed(req.method(), req.uri().path())
+    {
+        return crate::console::platform_auth::authorization_denied_response();
+    }
+    next.run(req).await
 }
 
 fn json_response(status: StatusCode, val: serde_json::Value) -> Response {
@@ -1596,7 +1677,7 @@ pub async fn handle_events(
     if let Some(denied) = eval.gate_public_read("ci:queue.read") {
         return denied;
     }
-    if state.config.log_api_key.is_some()
+    if (state.config.log_api_key.is_some() || state.config.readonly_api_token.is_some())
         && state.config.proxy_secret.is_none()
         && !eval.is_authenticated()
     {
@@ -2114,5 +2195,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_is_readonly_token_route_allowed_matrix() {
+        for allowed in [
+            "/",
+            "/health",
+            "/api/health",
+            "/ha/status",
+            "/api/ha/status",
+            "/api/cluster/nodes",
+            "/cluster/status",
+            "/api/cluster/status",
+            "/queue",
+            "/api/queue",
+            "/api/ci/queue",
+            "/events",
+            "/api/events",
+            "/jobs",
+            "/api/jobs",
+            "/jobs/job-1",
+            "/api/jobs/job-1",
+            "/jobs/job-1/log",
+            "/api/jobs/job-1/log",
+            "/api/jobs/job-1/logs",
+            "/api/repos",
+            "/api/repos/LMA1980/demo/summary",
+            "/api/repos/LMA1980/demo/topology",
+            "/api/auth/folios",
+            "/api/auth/session",
+            "/badges/LMA1980/demo/status.svg",
+            "/cards/LMA1980/demo/card.svg",
+        ] {
+            assert!(
+                is_readonly_token_route_allowed(&Method::GET, allowed),
+                "GET {allowed} must be allowed for RO token"
+            );
+            assert!(
+                is_readonly_token_route_allowed(&Method::HEAD, allowed),
+                "HEAD {allowed} must be allowed for RO token"
+            );
+            for mut_method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(
+                    !is_readonly_token_route_allowed(&mut_method, allowed),
+                    "{mut_method} {allowed} must be rejected for RO token"
+                );
+            }
+        }
+
+        for denied_get in [
+            "/api/auth/users",
+            "/api/auth/invites",
+            "/api/auth/roles",
+            "/api/auth/role-folio-index",
+            "/api/auth/profile",
+            "/api/auth/passkeys",
+            "/api/auth/folios/custom",
+            "/api/internal/auth/snapshot",
+            "/api/cluster/tunnel",
+            "/webhook",
+            "/jobs/../api/auth/users",
+            "/api//auth/folios",
+        ] {
+            assert!(
+                !is_readonly_token_route_allowed(&Method::GET, denied_get),
+                "GET {denied_get} must be rejected for RO token"
+            );
+        }
     }
 }

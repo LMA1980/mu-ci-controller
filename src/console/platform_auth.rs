@@ -41,11 +41,26 @@ use crate::webhook::AppState;
 const DEFAULT_INVITE_TTL_SECS: u64 = 86_400;
 const MAX_INVITE_TTL_SECS: u64 = 30 * 86_400;
 
+/// Strictly read-only inspection policies granted to the dedicated read-only service
+/// bearer token (`MU_CI_CONTROLLER_READONLY_TOKEN_FILE` / `MU_CI_READONLY_TOKEN_FILE`).
+pub const READONLY_SERVICE_POLICIES: [&str; 8] = [
+    "ci:queue.read",
+    "ci:nodes.read",
+    "ci:ha.read",
+    "ci:jobs.read",
+    "ci:jobs.logs.read",
+    "ci:repos.public.read",
+    "ci:repos.private.read",
+    "platform:folios.read",
+];
+
 /// Full per-request authentication and `mu-auth` policy evaluation context.
 #[derive(Debug, Clone)]
 pub struct EvaluatedRequestAuth {
     /// Caller matched `Config::log_api_key`.
     pub is_admin_api_key: bool,
+    /// Caller matched `Config::readonly_api_token` (strictly read-only inspection tier).
+    pub is_readonly_api_token: bool,
     /// Validated GitHub login (original casing if bound, or header casing if uninvited).
     pub login: Option<String>,
     /// Lowercase key for state lookups.
@@ -99,8 +114,10 @@ impl EvaluatedRequestAuth {
             }
         }
 
-        if has_valid_admin_api_key(config, headers, query_key) {
-            return Self::admin_api_key(config, job_store);
+        match resolve_service_token_tier(config, headers, query_key) {
+            ServiceTokenTier::Admin => return Self::admin_api_key(config, job_store),
+            ServiceTokenTier::ReadOnly => return Self::readonly_api_token(config, job_store),
+            ServiceTokenTier::None => {}
         }
 
         let header_secret = headers.get("x-proxy-secret").and_then(|v| v.to_str().ok());
@@ -268,12 +285,14 @@ impl EvaluatedRequestAuth {
             });
 
         let auth_configured = config.log_api_key.is_some()
+            || config.readonly_api_token.is_some()
             || config.proxy_secret.is_some()
             || anonymous_lockdown
             || has_proxy_headers;
 
         Self {
             is_admin_api_key: false,
+            is_readonly_api_token: false,
             login: canonical_login,
             login_key,
             invite_bound,
@@ -343,10 +362,13 @@ impl EvaluatedRequestAuth {
             preferences: None,
             display_name: None,
         };
-        let auth_configured =
-            config.log_api_key.is_some() || config.proxy_secret.is_some() || anon_lockdown;
+        let auth_configured = config.log_api_key.is_some()
+            || config.readonly_api_token.is_some()
+            || config.proxy_secret.is_some()
+            || anon_lockdown;
         Self {
             is_admin_api_key: true,
+            is_readonly_api_token: false,
             login: None,
             login_key: None,
             invite_bound: true,
@@ -363,18 +385,78 @@ impl EvaluatedRequestAuth {
         }
     }
 
+    fn readonly_api_token(config: &Config, job_store: &JobStore) -> Self {
+        let (anon_lockdown, baseline) = job_store
+            .read_platform_auth(|st| {
+                (
+                    st.is_anonymous_lockdown(),
+                    st.baseline_role_id().to_string(),
+                )
+            })
+            .unwrap_or_else(|| (false, crate::auth::BASELINE_ROLE_ID.to_string()));
+        let active_policies_vec: Vec<String> = READONLY_SERVICE_POLICIES
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+        let policy_set: BTreeSet<String> = active_policies_vec.iter().cloned().collect();
+        let dto = AuthSessionDto {
+            authenticated: true,
+            github_login: None,
+            invite_bound: false,
+            role: Some("readonly-service".to_string()),
+            reason_code: None,
+            passkey_count: 0,
+            passkey_enrollment_required: false,
+            anonymous_lockdown: anon_lockdown,
+            anonymous_login_only: anon_lockdown,
+            baseline_role: Some(baseline),
+            bound_roles: vec!["readonly-service".to_string()],
+            bound_role_specs: Vec::new(),
+            catalog_role_specs: Vec::new(),
+            active_roles: Vec::new(),
+            leases: Vec::new(),
+            active_folios: Vec::new(),
+            active_policies: active_policies_vec,
+            preferences: None,
+            display_name: None,
+        };
+        let auth_configured = config.log_api_key.is_some()
+            || config.readonly_api_token.is_some()
+            || config.proxy_secret.is_some()
+            || anon_lockdown;
+        Self {
+            is_admin_api_key: false,
+            is_readonly_api_token: true,
+            login: None,
+            login_key: None,
+            invite_bound: false,
+            is_uninvited: false,
+            bad_edge_auth: false,
+            anonymous_lockdown: anon_lockdown,
+            auth_configured,
+            passkey_enrollment_required: false,
+            passkey_count: 0,
+            active_policies: policy_set,
+            anonymous_policies: BTreeSet::new(),
+            cookie_valid_for_elevated: false,
+            session_dto: dto,
+        }
+    }
+
     /// True when the caller is authenticated with console read/operate eligibility (`passkey_count > 0` or API key).
     #[must_use]
     pub const fn is_authenticated(&self) -> bool {
-        self.is_admin_api_key || (self.invite_bound && !self.passkey_enrollment_required)
+        self.is_admin_api_key
+            || self.is_readonly_api_token
+            || (self.invite_bound && !self.passkey_enrollment_required)
     }
 
     /// True if caller possesses the canonical `policy` string.
     #[must_use]
     pub fn has_policy(&self, policy: &str) -> bool {
         self.is_admin_api_key
-            || (self.invite_bound
-                && !self.passkey_enrollment_required
+            || ((self.is_readonly_api_token
+                || (self.invite_bound && !self.passkey_enrollment_required))
                 && self.active_policies.contains(policy))
     }
 
@@ -394,6 +476,12 @@ impl EvaluatedRequestAuth {
     pub fn gate_policy(&self, policy: &str) -> Option<Response> {
         if self.is_admin_api_key {
             return None;
+        }
+        if self.is_readonly_api_token {
+            if self.active_policies.contains(policy) {
+                return None;
+            }
+            return Some(authorization_denied_response());
         }
         if self.is_uninvited {
             return Some(authorization_denied_response());
@@ -421,6 +509,12 @@ impl EvaluatedRequestAuth {
     pub fn gate_public_read(&self, policy: &str) -> Option<Response> {
         if self.is_admin_api_key {
             return None;
+        }
+        if self.is_readonly_api_token {
+            if self.active_policies.contains(policy) {
+                return None;
+            }
+            return Some(authorization_denied_response());
         }
         if self.is_uninvited {
             return Some(authorization_denied_response());
@@ -452,10 +546,10 @@ impl EvaluatedRequestAuth {
         None
     }
 
-    /// Requires a bound GitHub user (never `Anonymous` or `AdminApiKey`); optionally requires
+    /// Requires a bound GitHub user (never `Anonymous` or API keys); optionally requires
     /// at least one enrolled Passkey.
     fn require_bound_user(&self, require_passkey: bool) -> AuthResult<(String, String)> {
-        if self.is_uninvited {
+        if self.is_readonly_api_token || self.is_uninvited {
             return err_resp(authorization_denied_response());
         }
         if !self.invite_bound {
@@ -476,47 +570,108 @@ impl EvaluatedRequestAuth {
     }
 }
 
-/// Checks bearer token, `X-Api-Key`, or `?key=` against `Config::log_api_key` in constant time.
+/// Resolved bearer/API-key service token tier using non-short-circuiting
+/// constant-time verification with monotonic read-only attenuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceTokenTier {
+    None,
+    Admin,
+    ReadOnly,
+}
+
+/// Evaluates both `Config::log_api_key` and `Config::readonly_api_token` across
+/// all presented token candidates in constant time without short-circuiting.
+///
+/// Monotonically attenuates to [`ServiceTokenTier::ReadOnly`] whenever the
+/// read-only token matches (including accidental identical configuration or
+/// combined admin + read-only headers).
+pub(crate) fn resolve_service_token_tier(
+    config: &Config,
+    headers: &HeaderMap,
+    query_key: Option<&str>,
+) -> ServiceTokenTier {
+    let matches_admin = has_valid_admin_api_key(config, headers, query_key);
+    let matches_readonly = has_valid_readonly_api_token(config, headers, query_key);
+    if matches_readonly {
+        ServiceTokenTier::ReadOnly
+    } else if matches_admin {
+        ServiceTokenTier::Admin
+    } else {
+        ServiceTokenTier::None
+    }
+}
+
+/// Checks bearer token, `X-Api-Key`, or `?key=` against `Config::log_api_key` in constant time
+/// without short-circuiting across header/query candidates.
 pub(crate) fn has_valid_admin_api_key(
     config: &Config,
     headers: &HeaderMap,
     query_key: Option<&str>,
 ) -> bool {
-    let Some(expected) = config.log_api_key.as_deref() else {
+    let Some(expected) = config
+        .log_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return false;
     };
-    if let Some(provided) = extract_api_key_candidate(headers, query_key) {
-        return constant_time_eq(provided.as_bytes(), expected.as_bytes());
+    let mut matched = false;
+    for provided in api_key_candidates(headers, query_key) {
+        matched |= constant_time_eq(provided.as_bytes(), expected.as_bytes());
     }
-    false
+    matched
 }
 
-fn extract_api_key_candidate<'a>(
+/// Checks bearer token, `X-Api-Key`, or `?key=` against `Config::readonly_api_token` in constant
+/// time without short-circuiting across header/query candidates.
+pub(crate) fn has_valid_readonly_api_token(
+    config: &Config,
+    headers: &HeaderMap,
+    query_key: Option<&str>,
+) -> bool {
+    let Some(expected) = config
+        .readonly_api_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let mut matched = false;
+    for provided in api_key_candidates(headers, query_key) {
+        matched |= constant_time_eq(provided.as_bytes(), expected.as_bytes());
+    }
+    matched
+}
+
+fn strip_bearer_prefix(s: &str) -> Option<&str> {
+    let prefix = s.get(..7)?;
+    if prefix.eq_ignore_ascii_case("bearer ") {
+        Some(&s[7..])
+    } else {
+        None
+    }
+}
+
+fn api_key_candidates<'a>(
     headers: &'a HeaderMap,
     query_key: Option<&'a str>,
-) -> Option<&'a str> {
-    if let Some(val) = headers
+) -> impl Iterator<Item = &'a str> {
+    let x_api_key = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return Some(val);
-    }
-    if let Some(val) = headers
+        .filter(|v| !v.is_empty());
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .and_then(|s| {
-            s.strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-        })
+        .and_then(strip_bearer_prefix)
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return Some(val);
-    }
-    query_key.map(str::trim).filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty());
+    let query = query_key.map(str::trim).filter(|v| !v.is_empty());
+    [x_api_key, bearer, query].into_iter().flatten()
 }
 
 fn extract_elevated_cookie(headers: &HeaderMap) -> Option<String> {
@@ -539,8 +694,10 @@ fn extract_elevated_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && bool::from(a.ct_eq(b))
+/// Compares two byte slices in constant time via `subtle::ConstantTimeEq`.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    bool::from(a.ct_eq(b))
 }
 
 type AuthResult<T> = Result<T, Box<Response>>;
@@ -923,6 +1080,9 @@ pub async fn redeem_invite(
     headers: HeaderMap,
     Json(raw_body): Json<Value>,
 ) -> Response {
+    if resolve_service_token_tier(&state.config, &headers, None) == ServiceTokenTier::ReadOnly {
+        return authorization_denied_response();
+    }
     if let Some(obj) = raw_body.as_object() {
         if obj.contains_key("role") || obj.contains_key("roles") || obj.contains_key("roles_json") {
             return bad_request_response(
@@ -3322,14 +3482,16 @@ fn is_authorized_internal_snapshot_caller(
     job_store: &JobStore,
     headers: &HeaderMap,
 ) -> AuthResult<()> {
-    if has_valid_admin_api_key(config, headers, None) {
-        return Ok(());
+    match resolve_service_token_tier(config, headers, None) {
+        ServiceTokenTier::Admin => return Ok(()),
+        ServiceTokenTier::ReadOnly => return err_resp(authorization_denied_response()),
+        ServiceTokenTier::None => {}
     }
     let eval = EvaluatedRequestAuth::evaluate(config, job_store, headers, None);
     if eval.is_platform_admin() {
         return Ok(());
     }
-    if eval.is_uninvited {
+    if eval.is_readonly_api_token || eval.is_uninvited {
         return err_resp(authorization_denied_response());
     }
     if eval.passkey_enrollment_required {
@@ -3386,4 +3548,195 @@ pub async fn internal_auth_snapshot(
         .header(CACHE_CONTROL, "no-cache")
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::console::api::{is_authenticated, resolve_auth, AuthResolution};
+
+    #[test]
+    fn test_constant_time_eq_and_readonly_token_matching() {
+        assert!(constant_time_eq(b"ro-token-abc123", b"ro-token-abc123"));
+        assert!(!constant_time_eq(b"ro-token-abc123", b"ro-token-abc124"));
+        assert!(!constant_time_eq(b"ro-token-abc123", b"xo-token-abc123"));
+        assert!(!constant_time_eq(b"ro-token-abc123", b"ro-token-abc12"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
+        assert!(constant_time_eq(b"", b""));
+
+        let cfg = Config {
+            log_api_key: Some("admin-token-xyz".to_string()),
+            readonly_api_token: Some("ro-token-abc123".to_string()),
+            ..Config::default()
+        };
+
+        let mut h_bearer = HeaderMap::new();
+        h_bearer.insert(
+            header::AUTHORIZATION,
+            "Bearer ro-token-abc123".parse().unwrap(),
+        );
+        assert!(has_valid_readonly_api_token(&cfg, &h_bearer, None));
+        assert!(!has_valid_admin_api_key(&cfg, &h_bearer, None));
+        assert!(is_authenticated(&cfg, &h_bearer));
+
+        let mut h_lower = HeaderMap::new();
+        h_lower.insert(
+            header::AUTHORIZATION,
+            "bearer ro-token-abc123".parse().unwrap(),
+        );
+        assert!(has_valid_readonly_api_token(&cfg, &h_lower, None));
+
+        let mut h_upper = HeaderMap::new();
+        h_upper.insert(
+            header::AUTHORIZATION,
+            "BEARER ro-token-abc123".parse().unwrap(),
+        );
+        assert!(has_valid_readonly_api_token(&cfg, &h_upper, None));
+
+        let mut h_api_key = HeaderMap::new();
+        h_api_key.insert("x-api-key", "ro-token-abc123".parse().unwrap());
+        assert!(has_valid_readonly_api_token(&cfg, &h_api_key, None));
+        assert!(!has_valid_admin_api_key(&cfg, &h_api_key, None));
+
+        assert!(has_valid_readonly_api_token(
+            &cfg,
+            &HeaderMap::new(),
+            Some("ro-token-abc123")
+        ));
+
+        let mut h_wrong = HeaderMap::new();
+        h_wrong.insert(
+            header::AUTHORIZATION,
+            "Bearer ro-token-abc124".parse().unwrap(),
+        );
+        assert!(!has_valid_readonly_api_token(&cfg, &h_wrong, None));
+        assert!(!has_valid_admin_api_key(&cfg, &h_wrong, None));
+        assert!(!is_authenticated(&cfg, &h_wrong));
+
+        // Empty configured token must never authenticate
+        let empty_cfg = Config {
+            readonly_api_token: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert!(!has_valid_readonly_api_token(
+            &empty_cfg,
+            &HeaderMap::new(),
+            Some("   ")
+        ));
+    }
+
+    #[test]
+    fn test_readonly_token_policy_and_auth_resolution_scoping() {
+        let cfg = Config {
+            log_api_key: Some("admin-secret-999".to_string()),
+            readonly_api_token: Some("readonly-secret-111".to_string()),
+            ..Config::default()
+        };
+        let store = JobStore::new(10, None);
+
+        let mut ro_headers = HeaderMap::new();
+        ro_headers.insert(
+            header::AUTHORIZATION,
+            "Bearer readonly-secret-111".parse().unwrap(),
+        );
+
+        let eval = EvaluatedRequestAuth::evaluate(&cfg, &store, &ro_headers, None);
+        assert!(eval.is_readonly_api_token);
+        assert!(!eval.is_admin_api_key);
+        assert!(eval.is_authenticated());
+        assert!(!eval.is_platform_admin());
+        assert_eq!(
+            resolve_auth(&cfg, &store, &ro_headers),
+            AuthResolution::ReadOnlyServiceToken
+        );
+        assert!(AuthResolution::ReadOnlyServiceToken.is_authenticated());
+        assert!(!AuthResolution::ReadOnlyServiceToken.is_admin());
+
+        for allowed in READONLY_SERVICE_POLICIES {
+            assert!(
+                eval.has_policy(allowed),
+                "Read-only token must hold {allowed}"
+            );
+            assert!(
+                eval.gate_policy(allowed).is_none(),
+                "gate_policy({allowed}) must succeed"
+            );
+            assert!(
+                eval.gate_public_read(allowed).is_none(),
+                "gate_public_read({allowed}) must succeed"
+            );
+        }
+
+        for denied in [
+            "ci:ha.write",
+            "ci:jobs.resume",
+            "ci:jobs.restart",
+            "platform:folios.write",
+            "platform:roles.read",
+            "platform:roles.write",
+            "platform:users.read",
+            "platform:users.write",
+            "platform:invites.read",
+            "platform:invites.write",
+        ] {
+            assert!(
+                !eval.has_policy(denied),
+                "Read-only token must NOT hold {denied}"
+            );
+            let resp = eval
+                .gate_policy(denied)
+                .unwrap_or_else(|| panic!("gate_policy({denied}) must reject RO token"));
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "gate_policy({denied}) must return 403 Forbidden (not 401)"
+            );
+        }
+
+        // Invalid token with only readonly_api_token configured must fail closed with 401
+        let ro_only_cfg = Config {
+            log_api_key: None,
+            readonly_api_token: Some("readonly-secret-111".to_string()),
+            ..Config::default()
+        };
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert(
+            header::AUTHORIZATION,
+            "Bearer wrong-token-000".parse().unwrap(),
+        );
+        let bad_eval = EvaluatedRequestAuth::evaluate(&ro_only_cfg, &store, &bad_headers, None);
+        assert!(!bad_eval.is_authenticated());
+        let unauth_resp = bad_eval
+            .gate_policy("platform:folios.read")
+            .expect("invalid token must be denied");
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Monotonic attenuation: identical admin & RO tokens OR combined admin + RO headers
+        // must always attenuate strictly to ReadOnly (never elevate to Admin).
+        let identical_cfg = Config {
+            log_api_key: Some("shared-misconfigured-token".to_string()),
+            readonly_api_token: Some("shared-misconfigured-token".to_string()),
+            ..Config::default()
+        };
+        let mut identical_hdr = HeaderMap::new();
+        identical_hdr.insert(
+            header::AUTHORIZATION,
+            "Bearer shared-misconfigured-token".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_service_token_tier(&identical_cfg, &identical_hdr, None),
+            ServiceTokenTier::ReadOnly
+        );
+
+        let mut combined_hdr = HeaderMap::new();
+        combined_hdr.insert("x-api-key", "admin-secret-999".parse().unwrap());
+        combined_hdr.insert(
+            header::AUTHORIZATION,
+            "Bearer readonly-secret-111".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_service_token_tier(&cfg, &combined_hdr, None),
+            ServiceTokenTier::ReadOnly
+        );
+    }
 }
