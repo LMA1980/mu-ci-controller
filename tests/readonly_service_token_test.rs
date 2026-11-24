@@ -170,16 +170,22 @@ fn assert_no_secret_leak(
     body: &str,
     ctx: &str,
 ) {
-    for secret in [READONLY_TOKEN, ADMIN_TOKEN, INVALID_TOKEN] {
+    for access_tier in ["readonly-service", "admin-service", "unrecognized-probe"] {
+        let probe_value = match access_tier {
+            "readonly-service" => READONLY_TOKEN,
+            "admin-service" => ADMIN_TOKEN,
+            "unrecognized-probe" => INVALID_TOKEN,
+            _ => unreachable!(),
+        };
         assert!(
-            !body.contains(secret),
-            "Secret '{secret}' leaked into response body ({status}) for {ctx}: {body}"
+            !body.contains(probe_value),
+            "Fixture value for '{access_tier}' tier leaked into response body ({status}) for {ctx}"
         );
         for (name, val) in headers {
             if let Ok(s) = val.to_str() {
                 assert!(
-                    !s.contains(secret),
-                    "Secret '{secret}' leaked into header '{name}' ({status}) for {ctx}"
+                    !s.contains(probe_value),
+                    "Fixture value for '{access_tier}' tier leaked into header '{name}' ({status}) for {ctx}"
                 );
             }
         }
