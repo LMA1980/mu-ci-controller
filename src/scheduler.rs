@@ -1749,6 +1749,23 @@ pub const CD_MANIFEST_CANDIDATES: &[&str] = &[
     ".muconde/mu-cd.yaml",
 ];
 
+/// Canonical deployable services eligible for manifest-free post-CI CD triggers.
+pub const DEFAULT_CD_MANAGED_SERVICES: &[&str] = &[
+    "jero-runner",
+    "mu-cd-agent",
+    "mu-cd-controller",
+    "mu-ci-controller",
+    "mu-ci-web",
+    "mu-ci-worker",
+    "mu-console",
+    "mu-observable-collector",
+    "mu-observable-hub",
+    "mu-observable-sentinel",
+    "mu-registry",
+];
+
+const MU_CI_WORKFLOW_CANDIDATES: &[&str] = &[".muci/mu-ci.yml", ".muci/mu-ci.yaml"];
+
 /// Returns `true` when `job` represents a `push` or `merge` event on the `main` branch.
 #[must_use]
 pub fn is_main_push_or_merge(job: &Job) -> bool {
@@ -1757,11 +1774,13 @@ pub fn is_main_push_or_merge(job: &Job) -> bool {
         && (job.ref_name == "refs/heads/main" || job.ref_name == "main")
 }
 
-/// Resolves the raw YAML content of a repository's CD manifest from either `git show <sha>:<cand>`
-/// or the local `repo_workspace` checkout.
-pub async fn resolve_cd_manifest_yaml(repo_workspace: &Path, commit_sha: &str) -> Option<String> {
+async fn resolve_repo_text_file(
+    repo_workspace: &Path,
+    commit_sha: &str,
+    candidates: &[&str],
+) -> Option<String> {
     if !commit_sha.trim().is_empty() && repo_workspace.join(".git").exists() {
-        for cand in CD_MANIFEST_CANDIDATES {
+        for cand in candidates {
             let git_spec = format!("{commit_sha}:{cand}");
             if let Ok(out) = tokio::process::Command::new("git")
                 .arg("-C")
@@ -1782,7 +1801,7 @@ pub async fn resolve_cd_manifest_yaml(repo_workspace: &Path, commit_sha: &str) -
         }
     }
 
-    for cand in CD_MANIFEST_CANDIDATES {
+    for cand in candidates {
         let p = repo_workspace.join(cand);
         if let Ok(content) = tokio::fs::read_to_string(&p).await {
             if !content.trim().is_empty() {
@@ -1791,6 +1810,48 @@ pub async fn resolve_cd_manifest_yaml(repo_workspace: &Path, commit_sha: &str) -
         }
     }
     None
+}
+
+async fn repo_has_file_at_commit_or_workspace(
+    repo_workspace: &Path,
+    commit_sha: &str,
+    rel_path: &str,
+) -> bool {
+    if repo_workspace.join(rel_path).is_file() {
+        return true;
+    }
+    if !commit_sha.trim().is_empty() && repo_workspace.join(".git").exists() {
+        let git_spec = format!("{commit_sha}:{rel_path}");
+        if let Ok(out) = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_workspace)
+            .args(["cat-file", "-e", &git_spec])
+            .output()
+            .await
+        {
+            return out.status.success();
+        }
+    }
+    false
+}
+
+/// Resolves the raw YAML content of a repository's CD manifest from either `git show <sha>:<cand>`
+/// or the local `repo_workspace` checkout.
+pub async fn resolve_cd_manifest_yaml(repo_workspace: &Path, commit_sha: &str) -> Option<String> {
+    resolve_repo_text_file(repo_workspace, commit_sha, CD_MANIFEST_CANDIDATES).await
+}
+
+async fn resolve_mu_ci_workflow_yaml(repo_workspace: &Path, commit_sha: &str) -> Option<String> {
+    resolve_repo_text_file(repo_workspace, commit_sha, MU_CI_WORKFLOW_CANDIDATES).await
+}
+
+pub(crate) fn repo_short_slug(repo_name: &str) -> &str {
+    repo_name
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| repo_name.trim())
 }
 
 /// Extracts the `service` identifier from a `MuConDe` YAML manifest, falling back to the repository short name.
@@ -1804,12 +1865,7 @@ pub fn extract_cd_service_name(manifest_yaml: &str, repo_name: &str) -> String {
             }
         }
     }
-    repo_name
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(repo_name)
-        .to_string()
+    repo_short_slug(repo_name).to_string()
 }
 
 fn load_secret_from_values(
@@ -1934,7 +1990,9 @@ pub struct PostCiCdEndpointConfig<'a> {
 }
 
 mod post_ci_cd {
-    use super::{extract_cd_service_name, first_non_empty_env};
+    use super::{
+        extract_cd_service_name, first_non_empty_env, repo_short_slug, DEFAULT_CD_MANAGED_SERVICES,
+    };
     use flate2::{read::GzDecoder, write::GzEncoder, Compression};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
@@ -2062,6 +2120,112 @@ mod post_ci_cd {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct RawMuCiCdConfig {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        service: Option<String>,
+        #[serde(default)]
+        binary: Option<String>,
+        #[serde(default)]
+        install_path: Option<String>,
+        #[serde(default)]
+        web_root: Option<String>,
+        #[serde(default)]
+        artifact: Option<String>,
+        #[serde(default)]
+        target_nodes: Vec<String>,
+        #[serde(default)]
+        integration_tests: Option<serde_yaml::Value>,
+    }
+
+    enum MuCiCdDirective {
+        Disabled,
+        Enabled(Box<RawMuCiCdConfig>),
+        Unspecified,
+    }
+
+    fn parse_mu_ci_cd_directive(muci_yaml: Option<&str>) -> MuCiCdDirective {
+        let Some(raw) = muci_yaml else {
+            return MuCiCdDirective::Unspecified;
+        };
+        let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
+            return MuCiCdDirective::Unspecified;
+        };
+        let Some(cd_val) = val.get("cd") else {
+            return MuCiCdDirective::Unspecified;
+        };
+        match cd_val {
+            serde_yaml::Value::Bool(false) | serde_yaml::Value::Null => MuCiCdDirective::Disabled,
+            serde_yaml::Value::Bool(true) => MuCiCdDirective::Enabled(Box::default()),
+            serde_yaml::Value::Mapping(_) => {
+                let parsed =
+                    serde_yaml::from_value::<RawMuCiCdConfig>(cd_val.clone()).unwrap_or_default();
+                if parsed.enabled == Some(false) {
+                    MuCiCdDirective::Disabled
+                } else {
+                    MuCiCdDirective::Enabled(Box::new(parsed))
+                }
+            }
+            _ => MuCiCdDirective::Unspecified,
+        }
+    }
+
+    pub(super) fn is_managed_service_slug(
+        repo_short: &str,
+        managed_override: Option<&str>,
+    ) -> bool {
+        let normalized_slug = repo_short.trim().to_ascii_lowercase();
+        if normalized_slug.is_empty() {
+            return false;
+        }
+        if let Some(csv) = managed_override.map(str::trim).filter(|s| !s.is_empty()) {
+            return csv
+                .split(',')
+                .map(|item| item.trim().to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .any(|item| item == normalized_slug);
+        }
+        DEFAULT_CD_MANAGED_SERVICES
+            .iter()
+            .any(|svc| svc.eq_ignore_ascii_case(&normalized_slug))
+    }
+
+    pub(super) fn synthesize_cd_manifest_summary(
+        repo_name: &str,
+        muci_yaml: Option<&str>,
+        managed_override: Option<&str>,
+        has_trunk_toml: bool,
+    ) -> Option<CdManifestSummary> {
+        let repo_short = repo_short_slug(repo_name);
+        let cfg = match parse_mu_ci_cd_directive(muci_yaml) {
+            MuCiCdDirective::Disabled => return None,
+            MuCiCdDirective::Enabled(cfg) => *cfg,
+            MuCiCdDirective::Unspecified => {
+                if !is_managed_service_slug(repo_short, managed_override) {
+                    return None;
+                }
+                RawMuCiCdConfig::default()
+            }
+        };
+
+        let service_name = clean_opt(cfg.service).unwrap_or_else(|| repo_short.to_string());
+        let is_spa = has_trunk_toml || is_static_web_service_name(&service_name);
+        let artifact = clean_opt(cfg.artifact).or_else(|| is_spa.then(|| "dist".to_string()));
+        let integration_tests = parse_integration_tests(cfg.integration_tests);
+
+        Some(CdManifestSummary {
+            service_name,
+            binary: clean_opt(cfg.binary),
+            install_path: clean_opt(cfg.install_path),
+            web_root: clean_opt(cfg.web_root),
+            artifact,
+            target_nodes: cfg.target_nodes,
+            integration_tests,
+        })
     }
 
     pub(super) fn parse_cd_manifest_summary(
@@ -2372,7 +2536,7 @@ mod post_ci_cd {
         )
     }
 
-    fn is_static_web_deployment(summary: &CdManifestSummary) -> bool {
+    pub(super) fn is_static_web_deployment(summary: &CdManifestSummary) -> bool {
         if is_static_web_service_name(&summary.service_name) || summary.web_root.is_some() {
             return true;
         }
@@ -2598,6 +2762,25 @@ mod post_ci_cd {
                 let bin_path = abs_dir.join(bin_name);
                 if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
                     return Ok(pkg);
+                }
+            }
+        }
+
+        if workspace_root.join("Cargo.toml").is_file() {
+            let (cargo_bins, _) = discover_cargo_bin_targets(workspace_root);
+            let extra_bins: Vec<String> = cargo_bins
+                .into_iter()
+                .filter(|b| !candidates.iter().any(|existing| existing == b))
+                .collect();
+            if !extra_bins.is_empty() {
+                for rel_dir in candidate_target_release_subdirs(expected_arch) {
+                    let abs_dir = target_dir.join(&rel_dir);
+                    for bin_name in &extra_bins {
+                        let bin_path = abs_dir.join(bin_name);
+                        if let Some(pkg) = read_validated_binary(&bin_path, expected_arch)? {
+                            return Ok(pkg);
+                        }
+                    }
                 }
             }
         }
@@ -3344,6 +3527,20 @@ mod post_ci_cd {
             return Ok(pkg);
         }
 
+        let smoke_stems = discover_smoke_test_stems(repo_workspace)?;
+        if !smoke_stems.is_empty() && repo_workspace.join("Cargo.toml").is_file() {
+            let target_dir = resolve_release_target_dir(repo_workspace);
+            let ctx = CompiledSmokePackageCtx {
+                checkout_dir: repo_workspace,
+                target_dir: &target_dir,
+                summary,
+                expected_arch,
+                commit_sha,
+                artifact_sha256,
+            };
+            return compile_and_package_smoke_tests(&ctx, &smoke_stems);
+        }
+
         let selects_custom_smoke = !is_static_web_deployment(summary)
             && summary
                 .integration_tests
@@ -3623,22 +3820,19 @@ mod post_ci_cd {
         }
     }
 
-    fn select_cargo_bin_target(
-        checkout_dir: &Path,
-        candidates: &[String],
-    ) -> (Option<String>, bool) {
+    fn discover_cargo_bin_targets(checkout_dir: &Path) -> (Vec<String>, bool) {
         let Ok(out) = std::process::Command::new("cargo")
             .current_dir(checkout_dir)
             .args(["metadata", "--no-deps", "--format-version", "1"])
             .output()
         else {
-            return (None, false);
+            return (Vec::new(), false);
         };
         if !out.status.success() {
-            return (None, false);
+            return (Vec::new(), false);
         }
         let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return (None, false);
+            return (Vec::new(), false);
         };
         let mut bin_names = Vec::new();
         if let Some(packages) = meta.get("packages").and_then(|v| v.as_array()) {
@@ -3651,21 +3845,36 @@ mod post_ci_cd {
                             .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
                         if is_bin {
                             if let Some(name) = target.get("name").and_then(|n| n.as_str()) {
-                                bin_names.push(name.to_string());
+                                push_unique_name(&mut bin_names, name);
                             }
                         }
                     }
                 }
             }
         }
-        let matched = candidates
-            .iter()
-            .find(|cand| bin_names.iter().any(|b| b == *cand))
-            .cloned();
         let is_virtual_workspace = meta
             .get("resolve")
             .and_then(|r| r.get("root"))
             .is_some_and(serde_json::Value::is_null);
+        (bin_names, is_virtual_workspace)
+    }
+
+    fn select_cargo_bin_target(
+        checkout_dir: &Path,
+        candidates: &[String],
+    ) -> (Option<String>, bool) {
+        let (bin_names, is_virtual_workspace) = discover_cargo_bin_targets(checkout_dir);
+        let matched = candidates
+            .iter()
+            .find(|cand| bin_names.iter().any(|b| b == *cand))
+            .cloned()
+            .or_else(|| {
+                if bin_names.len() == 1 {
+                    bin_names.into_iter().next()
+                } else {
+                    None
+                }
+            });
         (matched, is_virtual_workspace)
     }
 
@@ -4317,7 +4526,8 @@ mod post_ci_cd {
 }
 
 /// Triggers post-CI Continuous Distribution (`MuRegist`) and Continuous Deployment (`MuConDe`)
-/// when a `main` branch `push` or `merge` job succeeds and the repository defines a CD manifest.
+/// when a `main` branch `push` or `merge` job succeeds for a repository with a CD manifest
+/// or a manifest-free CD-managed service.
 pub async fn trigger_post_ci_cd_pipeline(job: &Job, repo_workspace: &Path) -> bool {
     let muregist_url =
         first_non_empty_env(&["MUREGIST_API_URL", "MUREGIST_URL", "MUCONDE_REGISTRY_URL"]);
@@ -4399,11 +4609,6 @@ pub async fn trigger_post_ci_cd_pipeline_with_config(
         return false;
     }
 
-    let manifest_yaml = match resolve_cd_manifest_yaml(repo_workspace, &job.commit_sha).await {
-        Some(yaml) => yaml,
-        None => return false,
-    };
-
     let reg_base = endpoints
         .muregist_api_url
         .map(str::trim)
@@ -4416,7 +4621,34 @@ pub async fn trigger_post_ci_cd_pipeline_with_config(
         return false;
     }
 
-    let summary = post_ci_cd::parse_cd_manifest_summary(&manifest_yaml, &job.repo_name);
+    let summary = if let Some(manifest_yaml) =
+        resolve_cd_manifest_yaml(repo_workspace, &job.commit_sha).await
+    {
+        post_ci_cd::parse_cd_manifest_summary(&manifest_yaml, &job.repo_name)
+    } else {
+        let muci_yaml = resolve_mu_ci_workflow_yaml(repo_workspace, &job.commit_sha).await;
+        let managed_override = std::env::var("MU_CI_CD_MANAGED_SERVICES").ok();
+        let has_trunk_toml =
+            repo_has_file_at_commit_or_workspace(repo_workspace, &job.commit_sha, "Trunk.toml")
+                .await;
+        match post_ci_cd::synthesize_cd_manifest_summary(
+            &job.repo_name,
+            muci_yaml.as_deref(),
+            managed_override.as_deref(),
+            has_trunk_toml,
+        ) {
+            Some(synthesized) => {
+                info!(
+                    job_id = %job.id,
+                    repo = %job.repo_name,
+                    service = %synthesized.service_name,
+                    "Synthesized manifest-free post-CI CD summary for managed service"
+                );
+                synthesized
+            }
+            None => return false,
+        }
+    };
     let (client, cert_san) = match post_ci_cd::build_cd_http_client(
         endpoints.tls_ca_path,
         endpoints.tls_cert_path,
@@ -7051,5 +7283,465 @@ not-json-line
                 "wait",
             ]
         );
+    }
+
+    #[test]
+    fn test_synthesize_cd_manifest_summary_managed_vs_non_managed() {
+        for svc in DEFAULT_CD_MANAGED_SERVICES {
+            let repo = format!("LMA1980/{svc}");
+            let summary = post_ci_cd::synthesize_cd_manifest_summary(&repo, None, None, false)
+                .unwrap_or_else(|| panic!("expected {svc} to be CD-managed"));
+            assert_eq!(summary.service_name, *svc);
+            assert!(summary.target_nodes.is_empty());
+            if *svc == "mu-ci-web" || *svc == "mu-console" {
+                assert_eq!(summary.artifact.as_deref(), Some("dist"));
+                assert!(post_ci_cd::is_static_web_deployment(&summary));
+            } else {
+                assert!(!post_ci_cd::is_static_web_deployment(&summary));
+            }
+        }
+
+        for non_service in [
+            "mu-ci",
+            "mu-cd",
+            "mu-observable",
+            "mu-ci-ipc",
+            "mu-cd-ipc",
+            "mu-observable-ipc",
+            "mu-deploy",
+            "lma1980.github.io",
+            "arbitrary-non-service",
+        ] {
+            let repo = format!("LMA1980/{non_service}");
+            assert!(
+                post_ci_cd::synthesize_cd_manifest_summary(&repo, None, None, true).is_none(),
+                "expected {non_service} without .muci cd metadata to return None"
+            );
+        }
+
+        // MU_CI_CD_MANAGED_SERVICES override replaces the default managed set.
+        let custom_summary = post_ci_cd::synthesize_cd_manifest_summary(
+            "LMA1980/custom-svc",
+            None,
+            Some("custom-svc, another-svc"),
+            false,
+        )
+        .expect("custom-svc should match override");
+        assert_eq!(custom_summary.service_name, "custom-svc");
+        assert!(post_ci_cd::synthesize_cd_manifest_summary(
+            "LMA1980/mu-ci-controller",
+            None,
+            Some("custom-svc, another-svc"),
+            false,
+        )
+        .is_none());
+
+        // Optional .muci/mu-ci.yml cd metadata enables/configures custom repos and supports opt-out.
+        let muci_opt_in = "version: \"3\"\nname: \"spa\"\ncd:\n  enabled: true\n  service: \"custom-spa\"\ntasks: {}\nstages: []\non_action: {}\n";
+        let spa_summary = post_ci_cd::synthesize_cd_manifest_summary(
+            "LMA1980/custom-spa-repo",
+            Some(muci_opt_in),
+            None,
+            true,
+        )
+        .expect("cd.enabled: true should enable manifest-free CD");
+        assert_eq!(spa_summary.service_name, "custom-spa");
+        assert_eq!(spa_summary.artifact.as_deref(), Some("dist"));
+        assert!(post_ci_cd::is_static_web_deployment(&spa_summary));
+
+        let muci_opt_out = "version: \"3\"\nname: \"disabled\"\ncd:\n  enabled: false\n";
+        assert!(post_ci_cd::synthesize_cd_manifest_summary(
+            "LMA1980/mu-ci-controller",
+            Some(muci_opt_out),
+            None,
+            false,
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_manifest_free_rust_binary_and_smoke_it() {
+        use std::collections::BTreeMap;
+        use std::io::Read as _;
+
+        // Case 1: Canonical managed service in --no-checkout workspace without .mucd/ or .muconde/
+        let root = tempdir().unwrap();
+        let src_repo = root.path().join("src-managed-rust");
+        std::fs::create_dir_all(src_repo.join("src")).unwrap();
+        std::fs::create_dir_all(src_repo.join("tests")).unwrap();
+        std::fs::write(
+            src_repo.join("Cargo.toml"),
+            "[package]\nname = \"mu-ci-controller\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("src/main.rs"),
+            "fn main() {\n    println!(\"mu-ci-controller ok\");\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_repo.join("tests/smoke_mu_ci_controller.rs"),
+            "#[test]\nfn smoke_ok() {\n    assert_eq!(1 + 1, 2);\n}\n",
+        )
+        .unwrap();
+
+        run_isolated_git(&src_repo, &["init", "-b", "main"]);
+        run_isolated_git(&src_repo, &["config", "user.name", "CI Test"]);
+        run_isolated_git(&src_repo, &["config", "user.email", "ci@example.invalid"]);
+        run_isolated_git(&src_repo, &["add", "."]);
+        run_isolated_git(&src_repo, &["commit", "-m", "manifest-free rust service"]);
+        let sha = run_isolated_git(&src_repo, &["rev-parse", "HEAD"]);
+
+        let no_checkout_ws = root.path().join("no-checkout-managed-rust");
+        let clone_out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args([
+                "clone",
+                "--no-checkout",
+                src_repo.to_str().unwrap(),
+                no_checkout_ws.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(clone_out.status.success());
+
+        let (base_url, captured_reg, captured_deploy) =
+            spawn_mock_post_ci_registry_and_cd_server("bundle-mf-rust-001").await;
+
+        let job = Job {
+            id: "job-mf-rust".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-controller".to_string(),
+            clone_url: src_repo.display().to_string(),
+            commit_sha: sha.clone(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        let cfg = PostCiCdEndpointConfig {
+            muregist_api_url: Some(&base_url),
+            muregist_api_token: None,
+            muregist_client_cert_san: None,
+            tls_ca_path: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            muconde_cd_api_url: Some(&base_url),
+            cd_api_token: Some("test-cd-token"),
+        };
+        assert!(trigger_post_ci_cd_pipeline_with_config(&job, &no_checkout_ws, &cfg).await);
+
+        let reg_calls = captured_reg.lock().unwrap().clone();
+        assert_eq!(reg_calls.len(), 1);
+        let parts = &reg_calls[0].1;
+        assert_eq!(parts["service_name"].1, b"mu-ci-controller");
+        assert_eq!(parts["binary"].0.as_deref(), Some("mu-ci-controller"));
+        let bin_sha = post_ci_cd::compute_sha256_hex(&parts["binary"].1);
+        let it_sha = post_ci_cd::compute_sha256_hex(&parts["it_archive"].1);
+
+        let mut it_entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut it_archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            parts["it_archive"].1.as_slice(),
+        ));
+        for entry in it_archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let path = e.path().unwrap().display().to_string();
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            it_entries.insert(path, buf);
+        }
+        let manifest: post_ci_cd::ItManifestJson =
+            serde_json::from_slice(it_entries.get("manifest.json").unwrap()).unwrap();
+        assert_eq!(manifest.service, "mu-ci-controller");
+        assert_eq!(manifest.tests.len(), 1);
+        assert_eq!(manifest.tests[0].name, "smoke_mu_ci_controller");
+        assert!(it_entries.contains_key("bin/smoke_mu_ci_controller"));
+
+        let deploy_calls = captured_deploy.lock().unwrap().clone();
+        assert_eq!(deploy_calls.len(), 1);
+        let body = &deploy_calls[0].2;
+        assert_eq!(body["repo"], "LMA1980/mu-ci-controller");
+        assert_eq!(body["service"], "mu-ci-controller");
+        assert_eq!(body["git_commit"], sha);
+        assert_eq!(body["binary_digest"], bin_sha);
+        assert_eq!(body["it_archive_digest"], it_sha);
+        assert_eq!(body["bundle_id"], "bundle-mf-rust-001");
+        assert!(body.get("manifest_yaml").is_none());
+        assert!(body.get("config").is_none());
+        assert!(body.get("repo_path").is_none());
+
+        // Case 2: Checked-out repo with .muci/mu-ci.yml cd metadata, custom Cargo.toml [[bin]] target
+        // in target/<triple>/release/<bin>, empty target_nodes, and tests/smoke_custom.rs
+        let checked_out = root.path().join("checked-out-custom-bin");
+        std::fs::create_dir_all(checked_out.join(".muci")).unwrap();
+        std::fs::create_dir_all(checked_out.join("src")).unwrap();
+        std::fs::create_dir_all(checked_out.join("tests")).unwrap();
+        let triple_release = checked_out.join("target/x86_64-unknown-linux-gnu/release");
+        std::fs::create_dir_all(&triple_release).unwrap();
+        std::fs::write(
+            checked_out.join(".muci/mu-ci.yml"),
+            "version: \"3\"\nname: \"custom-svc\"\ncd:\n  enabled: true\ntasks: {}\nstages: []\non_action: {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checked_out.join("Cargo.toml"),
+            "[package]\nname = \"custom-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"custom-daemon\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(checked_out.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            checked_out.join("tests/smoke_custom.rs"),
+            "#[test]\nfn smoke_custom_ok() {\n    assert!(true);\n}\n",
+        )
+        .unwrap();
+        let elf_bytes = make_test_elf_header(0x003E);
+        std::fs::write(triple_release.join("custom-daemon"), &elf_bytes).unwrap();
+
+        let (base_url2, captured_reg2, captured_deploy2) =
+            spawn_mock_post_ci_registry_and_cd_server("bundle-mf-rust-002").await;
+        let job2 = Job {
+            id: "job-mf-custom-bin".to_string(),
+            event_type: "merge".to_string(),
+            repo_name: "LMA1980/custom-svc".to_string(),
+            clone_url: "https://github.com/LMA1980/custom-svc.git".to_string(),
+            commit_sha: "feedface12345678".to_string(),
+            ref_name: "main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+        let cfg2 = PostCiCdEndpointConfig {
+            muregist_api_url: Some(&base_url2),
+            muregist_api_token: None,
+            muregist_client_cert_san: None,
+            tls_ca_path: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            muconde_cd_api_url: Some(&base_url2),
+            cd_api_token: Some("test-cd-token"),
+        };
+        assert!(trigger_post_ci_cd_pipeline_with_config(&job2, &checked_out, &cfg2).await);
+
+        let reg2 = captured_reg2.lock().unwrap().clone();
+        assert_eq!(reg2.len(), 1);
+        assert_eq!(reg2[0].1["service_name"].1, b"custom-svc");
+        assert_eq!(reg2[0].1["binary"].0.as_deref(), Some("custom-daemon"));
+        assert_eq!(reg2[0].1["binary"].1, elf_bytes);
+
+        let dep2 = captured_deploy2.lock().unwrap().clone();
+        assert_eq!(dep2.len(), 1);
+        let body2 = &dep2[0].2;
+        assert_eq!(body2["repo"], "LMA1980/custom-svc");
+        assert_eq!(body2["service"], "custom-svc");
+        assert_eq!(body2["bundle_id"], "bundle-mf-rust-002");
+        assert!(body2.get("manifest_yaml").is_none());
+        assert!(body2.get("config").is_none());
+        assert!(body2.get("repo_path").is_none());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_manifest_free_static_web_spa() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::write(
+            dir.path().join("Trunk.toml"),
+            "[build]\ntarget = \"index.html\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("dist/index.html"),
+            b"<html>mu-ci-web</html>",
+        )
+        .unwrap();
+
+        let (base_url, captured_reg, captured_deploy) =
+            spawn_mock_post_ci_registry_and_cd_server("bundle-mf-spa-001").await;
+
+        let job = Job {
+            id: "job-mf-spa".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-web".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-ci-web.git".to_string(),
+            commit_sha: "abc987654321".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+
+        let cfg = PostCiCdEndpointConfig {
+            muregist_api_url: Some(&base_url),
+            muregist_api_token: None,
+            muregist_client_cert_san: None,
+            tls_ca_path: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            muconde_cd_api_url: Some(&base_url),
+            cd_api_token: Some("test-cd-token"),
+        };
+        assert!(trigger_post_ci_cd_pipeline_with_config(&job, dir.path(), &cfg).await);
+
+        let reg_calls = captured_reg.lock().unwrap().clone();
+        assert_eq!(reg_calls.len(), 1);
+        let parts = &reg_calls[0].1;
+        assert_eq!(parts["service_name"].1, b"mu-ci-web");
+        assert_eq!(parts["binary"].0.as_deref(), Some("mu-ci-web-dist.tar.gz"));
+        let bin_sha = post_ci_cd::compute_sha256_hex(&parts["binary"].1);
+        let it_sha = post_ci_cd::compute_sha256_hex(&parts["it_archive"].1);
+
+        let mut tar_entries = Vec::new();
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(parts["binary"].1.as_slice()));
+        for entry in archive.entries().unwrap() {
+            tar_entries.push(entry.unwrap().path().unwrap().display().to_string());
+        }
+        assert!(tar_entries.contains(&"dist/index.html".to_string()));
+
+        let deploy_calls = captured_deploy.lock().unwrap().clone();
+        assert_eq!(deploy_calls.len(), 1);
+        let body = &deploy_calls[0].2;
+        assert_eq!(body["repo"], "LMA1980/mu-ci-web");
+        assert_eq!(body["service"], "mu-ci-web");
+        assert_eq!(body["git_commit"], "abc987654321");
+        assert_eq!(body["binary_digest"], bin_sha);
+        assert_eq!(body["it_archive_digest"], it_sha);
+        assert_eq!(body["bundle_id"], "bundle-mf-spa-001");
+        assert_eq!(body["wait"], false);
+        assert!(body.get("manifest_yaml").is_none());
+        assert!(body.get("config").is_none());
+        assert!(body.get("repo_path").is_none());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_manifest_free_non_managed_returns_false() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v1/bundles/it",
+                post({
+                    let hits = hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            axum::http::StatusCode::CREATED
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/cd/deploy",
+                post({
+                    let hits = hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let cfg = PostCiCdEndpointConfig {
+            muregist_api_url: Some(&base_url),
+            muregist_api_token: None,
+            muregist_client_cert_san: None,
+            tls_ca_path: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            muconde_cd_api_url: Some(&base_url),
+            cd_api_token: Some("test-cd-token"),
+        };
+
+        for non_managed in [
+            "LMA1980/mu-ci",
+            "LMA1980/mu-cd",
+            "LMA1980/mu-observable",
+            "LMA1980/mu-ci-ipc",
+            "LMA1980/mu-deploy",
+            "LMA1980/lma1980.github.io",
+            "LMA1980/arbitrary-non-service",
+        ] {
+            let dir = tempdir().unwrap();
+            let slug = non_managed.rsplit('/').next().unwrap();
+            std::fs::create_dir_all(dir.path().join(".muci")).unwrap();
+            std::fs::create_dir_all(dir.path().join("target/release")).unwrap();
+            std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+            std::fs::write(
+                dir.path().join(".muci/mu-ci.yml"),
+                "version: \"3\"\nname: \"ci-only\"\ntasks: {}\nstages: []\non_action: {}\n",
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("Trunk.toml"), "[build]\n").unwrap();
+            std::fs::write(dir.path().join("dist/index.html"), b"<html>docs</html>").unwrap();
+            std::fs::write(
+                dir.path().join("target/release").join(slug),
+                make_test_elf_header(0x003E),
+            )
+            .unwrap();
+
+            let job = Job {
+                id: format!("job-non-{slug}"),
+                event_type: "push".to_string(),
+                repo_name: non_managed.to_string(),
+                clone_url: format!("https://github.com/{non_managed}.git"),
+                commit_sha: "deadbeef0001".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                sender: "LMA1980".to_string(),
+                pr_number: None,
+                queued_at: Utc::now(),
+            };
+            assert!(
+                !trigger_post_ci_cd_pipeline_with_config(&job, dir.path(), &cfg).await,
+                "expected non-managed repo {non_managed} to return false"
+            );
+        }
+
+        // Canonical repo with explicit cd.enabled: false opt-out in .muci/mu-ci.yml also returns false.
+        let opt_out_dir = tempdir().unwrap();
+        std::fs::create_dir_all(opt_out_dir.path().join(".muci")).unwrap();
+        std::fs::create_dir_all(opt_out_dir.path().join("target/release")).unwrap();
+        std::fs::write(
+            opt_out_dir.path().join(".muci/mu-ci.yml"),
+            "version: \"3\"\nname: \"opt-out\"\ncd:\n  enabled: false\ntasks: {}\nstages: []\non_action: {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            opt_out_dir.path().join("target/release/mu-ci-controller"),
+            make_test_elf_header(0x003E),
+        )
+        .unwrap();
+        let opt_out_job = Job {
+            id: "job-opt-out".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+            commit_sha: "deadbeef0002".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: Utc::now(),
+        };
+        assert!(
+            !trigger_post_ci_cd_pipeline_with_config(&opt_out_job, opt_out_dir.path(), &cfg).await
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }
