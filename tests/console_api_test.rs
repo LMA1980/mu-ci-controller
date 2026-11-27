@@ -3095,7 +3095,7 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
         ("LMA1980/pub-404-gone", false),
         ("LMA1980/priv-404-gone", true),
         ("LMA1980/pub-redirect-old", false),
-        ("LMA1980/priv-secret-prune", true),
+        ("LMA1980/priv-batch-prune", true),
     ] {
         initial_repos.insert(
             name.to_string(),
@@ -3440,10 +3440,10 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(priv_prune["retired"], json!(["LMA1980/priv-push"]));
 
-    // Ensure priv-secret-prune is cached as private in console registry before mixed prune
+    // Ensure priv-batch-prune is cached as private in console registry before mixed prune
     state
         .console
-        .refresh_repo("LMA1980", "priv-secret-prune", None)
+        .refresh_repo("LMA1980", "priv-batch-prune", None)
         .await;
 
     let (st, mixed_prune, _) = send_req(
@@ -3451,13 +3451,13 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
         "POST",
         "/api/repos/prune",
         &api_hdrs,
-        Some(json!({"repos": ["LMA1980/pub-push", "LMA1980/priv-secret-prune"]})),
+        Some(json!({"repos": ["LMA1980/pub-push", "LMA1980/priv-batch-prune"]})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
         mixed_prune["retired"],
-        json!(["LMA1980/priv-secret-prune", "LMA1980/pub-push"])
+        json!(["LMA1980/priv-batch-prune", "LMA1980/pub-push"])
     );
 
     // Expected authenticated repos_changed count:
@@ -3483,8 +3483,8 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
     // 20: retired priv-404-gone (refresh_repo 404)
     // 21: retired pub-redirect-old (refresh_repo #236 redirect)
     // 22: pruned priv-push
-    // 23: discovered priv-secret-prune (refresh_repo)
-    // 24: pruned mixed (priv-secret-prune + pub-push)
+    // 23: discovered priv-batch-prune (refresh_repo)
+    // 24: pruned mixed (priv-batch-prune + pub-push)
     let auth_acc = read_until_count(&mut auth_stream, "repos_changed", 24).await;
     let auth_events = all_frame_data(&auth_acc, "repos_changed");
     assert_eq!(auth_events.len(), 24);
@@ -3521,7 +3521,7 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
     assert_eq!(auth_events[23]["pruned_count"], 2);
     assert_eq!(
         auth_events[23]["repos"],
-        json!(["LMA1980/priv-secret-prune", "LMA1980/pub-push"])
+        json!(["LMA1980/priv-batch-prune", "LMA1980/pub-push"])
     );
 
     // Expected anonymous repos_changed count (only public / redacted cross-boundary events):
@@ -3540,17 +3540,17 @@ async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
     // 13: retired pub-redirect-old
     // 14: pruned mixed (filtered strictly to pub-push, pruned_count = 1!)
     let anon_acc = read_until_count(&mut anon_stream, "repos_changed", 14).await;
-    for secret in [
+    for private_repo in [
         "priv-created",
         "priv-renamed",
         "priv-after-pub",
         "priv-push",
         "priv-404-gone",
-        "priv-secret-prune",
+        "priv-batch-prune",
     ] {
         assert!(
-            !anon_acc.contains(secret),
-            "private repository identifier `{secret}` leaked to anonymous SSE stream:\n{anon_acc}"
+            !anon_acc.contains(private_repo),
+            "unexpected private repository identifier in anonymous SSE stream"
         );
     }
     let anon_events = all_frame_data(&anon_acc, "repos_changed");
