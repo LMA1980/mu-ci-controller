@@ -1124,6 +1124,22 @@ impl JobStore {
             .await
     }
 
+    /// Upserts `record` to [`ControllerStorage`] while holding a read lock on `self.inner`,
+    /// skipping the write if the live in-memory record has already transitioned to
+    /// `JobStatus::Skipped` (unless `record` itself carries `JobStatus::Skipped`).
+    async fn upsert_record_unless_skipped(&self, record: &JobRecord) -> bool {
+        let store = self.inner.read().await;
+        if !matches!(record.status, JobStatus::Skipped { .. }) {
+            if let Some(current) = store.iter().find(|r| r.job.id == record.job.id) {
+                if matches!(current.status, JobStatus::Skipped { .. }) {
+                    return false;
+                }
+            }
+        }
+        self.run_storage_op(|db| db.upsert_record(record));
+        true
+    }
+
     /// Atomically claims the oldest `Queued` job in FIFO order whose ready stages can be satisfied
     /// by an available online worker slot in `cluster` (or whose stages have not yet been resolved
     /// while at least one worker slot is available).
@@ -1135,122 +1151,154 @@ impl JobStore {
         if !self.is_leader() {
             return None;
         }
-        let (claimed, healed) = {
-            let mut store = self.inner.write().await;
-            let now = Utc::now();
+        let (claimed, healed) = self
+            .claim_next_queued_job_inner(max_concurrent, cluster)
+            .await;
+        self.persist_claimed_and_healed(claimed, healed).await
+    }
 
-            let mut healed = Vec::new();
-            for r in store.iter_mut() {
-                let has_active_stages = r.stages.iter().any(|s| {
-                    matches!(
-                        s.status,
-                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                    )
-                });
-                if matches!(r.status, JobStatus::Queued) && has_active_stages {
-                    r.status = JobStatus::Running { started_at: now };
+    async fn claim_next_queued_job_inner(
+        &self,
+        max_concurrent: usize,
+        cluster: Option<&crate::cluster::ClusterRegistry>,
+    ) -> (Option<(Job, JobRecord)>, Vec<JobRecord>) {
+        let mut store = self.inner.write().await;
+        let now = Utc::now();
+
+        let mut healed = Vec::new();
+        for r in store.iter_mut() {
+            let has_active_stages = r.stages.iter().any(|s| {
+                matches!(
+                    s.status,
+                    StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                )
+            });
+            if matches!(r.status, JobStatus::Queued) && has_active_stages {
+                r.status = JobStatus::Running { started_at: now };
+                r.updated_at = now;
+                healed.push(r.clone());
+            } else if let Some(cluster_reg) = cluster {
+                if matches!(r.status, JobStatus::Running { .. })
+                    && !has_active_stages
+                    && !self.is_job_in_flight(&r.job.id)
+                    && !cluster_reg.has_active_leases_for_job(&r.job.id).await
+                {
+                    r.status = JobStatus::Queued;
                     r.updated_at = now;
                     healed.push(r.clone());
-                } else if let Some(cluster_reg) = cluster {
-                    if matches!(r.status, JobStatus::Running { .. })
-                        && !has_active_stages
-                        && !self.is_job_in_flight(&r.job.id)
-                        && !cluster_reg.has_active_leases_for_job(&r.job.id).await
-                    {
-                        r.status = JobStatus::Queued;
-                        r.updated_at = now;
-                        healed.push(r.clone());
-                    } else if sanitize_terminal_job_stages(r) {
-                        r.updated_at = now;
-                        healed.push(r.clone());
-                    }
                 } else if sanitize_terminal_job_stages(r) {
                     r.updated_at = now;
                     healed.push(r.clone());
                 }
+            } else if sanitize_terminal_job_stages(r) {
+                r.updated_at = now;
+                healed.push(r.clone());
             }
+        }
 
-            let mut running_count = 0;
-            let mut running_repos = std::collections::HashSet::new();
+        let mut running_count = 0;
+        let mut running_repos = std::collections::HashSet::new();
 
-            for r in store.iter() {
-                if matches!(r.status, JobStatus::Running { .. }) {
-                    running_count += 1;
-                    running_repos.insert(r.job.repo_name.clone());
-                }
+        for r in store.iter() {
+            if matches!(r.status, JobStatus::Running { .. }) {
+                running_count += 1;
+                running_repos.insert(r.job.repo_name.clone());
             }
+        }
 
-            if running_count >= max_concurrent {
-                (None, healed)
-            } else {
-                let active_unleased_job_ids: std::collections::HashSet<String> = store
-                    .iter()
-                    .filter(|r| {
-                        matches!(r.status, JobStatus::Running { .. })
-                            && !r.stages.iter().any(|s| {
-                                matches!(
-                                    s.status,
-                                    StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                                )
-                            })
-                    })
-                    .map(|r| r.job.id.clone())
-                    .collect();
-
-                let mut found = None;
-                for record in store.iter_mut().rev() {
-                    if !matches!(record.status, JobStatus::Queued)
-                        || running_repos.contains(&record.job.repo_name)
-                        || self.is_job_in_flight(&record.job.id)
-                    {
-                        continue;
-                    }
-
-                    let all_stages_terminal = !record.stages.is_empty()
-                        && !record.stages.iter().any(|s| {
+        if running_count >= max_concurrent {
+            (None, healed)
+        } else {
+            let active_unleased_job_ids: std::collections::HashSet<String> = store
+                .iter()
+                .filter(|r| {
+                    matches!(r.status, JobStatus::Running { .. })
+                        && !r.stages.iter().any(|s| {
                             matches!(
                                 s.status,
-                                StageStatus::Pending
-                                    | StageStatus::Assigned { .. }
-                                    | StageStatus::Running { .. }
+                                StageStatus::Assigned { .. } | StageStatus::Running { .. }
                             )
-                        });
+                        })
+                })
+                .map(|r| r.job.id.clone())
+                .collect();
 
-                    if let Some(cluster_reg) = cluster {
-                        if !all_stages_terminal {
-                            let can_run = cluster_reg
-                                .sync_and_try_reserve_for_claim(
-                                    &active_unleased_job_ids,
-                                    &record.job.id,
-                                    &record.stages,
-                                )
-                                .await;
-                            if !can_run {
-                                continue;
-                            }
+            let mut found = None;
+            for record in store.iter_mut().rev() {
+                if !matches!(record.status, JobStatus::Queued)
+                    || running_repos.contains(&record.job.repo_name)
+                    || self.is_job_in_flight(&record.job.id)
+                {
+                    continue;
+                }
+
+                let all_stages_terminal = !record.stages.is_empty()
+                    && !record.stages.iter().any(|s| {
+                        matches!(
+                            s.status,
+                            StageStatus::Pending
+                                | StageStatus::Assigned { .. }
+                                | StageStatus::Running { .. }
+                        )
+                    });
+
+                if let Some(cluster_reg) = cluster {
+                    if !all_stages_terminal {
+                        let can_run = cluster_reg
+                            .sync_and_try_reserve_for_claim(
+                                &active_unleased_job_ids,
+                                &record.job.id,
+                                &record.stages,
+                            )
+                            .await;
+                        if !can_run {
+                            continue;
                         }
                     }
-
-                    record.status = JobStatus::Running { started_at: now };
-                    record.updated_at = now;
-                    self.mark_job_in_flight(&record.job.id);
-                    found = Some((record.job.clone(), record.clone()));
-                    break;
                 }
-                (found, healed)
-            }
-        };
 
-        if !healed.is_empty() {
-            self.run_storage_op(|db| db.upsert_records_batch(&healed));
+                record.status = JobStatus::Running { started_at: now };
+                record.updated_at = now;
+                self.mark_job_in_flight(&record.job.id);
+                found = Some((record.job.clone(), record.clone()));
+                break;
+            }
+            (found, healed)
+        }
+    }
+
+    async fn persist_claimed_and_healed(
+        &self,
+        claimed: Option<(Job, JobRecord)>,
+        healed: Vec<JobRecord>,
+    ) -> Option<Job> {
+        let had_healed = !healed.is_empty();
+        if had_healed {
+            let store = self.inner.read().await;
+            let filtered_healed: Vec<JobRecord> = healed
+                .into_iter()
+                .filter(|h| {
+                    matches!(h.status, JobStatus::Skipped { .. })
+                        || !store
+                            .iter()
+                            .find(|r| r.job.id == h.job.id)
+                            .is_some_and(|r| matches!(r.status, JobStatus::Skipped { .. }))
+                })
+                .collect();
+            if !filtered_healed.is_empty() {
+                self.run_storage_op(|db| db.upsert_records_batch(&filtered_healed));
+            }
         }
 
         if let Some((job, record)) = claimed {
-            self.run_storage_op(|db| db.upsert_record(&record));
+            if !self.upsert_record_unless_skipped(&record).await {
+                self.release_in_flight_job(&job.id);
+                return None;
+            }
             self.persist().await;
             Some(job)
         } else {
-            if !healed.is_empty() {
+            if had_healed {
                 self.persist().await;
             }
             None
@@ -1264,43 +1312,56 @@ impl JobStore {
     /// "food sample" stages so it retains its original FIFO priority when a matching worker
     /// slot becomes free.
     pub async fn requeue_preserving_priority(&self, job_id: &str) -> bool {
+        let mut already_skipped = false;
         let requeued_record = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-                let has_active_stages = record.stages.iter().any(|s| {
-                    matches!(
-                        s.status,
-                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                    )
-                });
-                let all_stages_terminal = !record.stages.is_empty()
-                    && !record.stages.iter().any(|s| {
+                if matches!(record.status, JobStatus::Skipped { .. }) {
+                    already_skipped = true;
+                    None
+                } else {
+                    let has_active_stages = record.stages.iter().any(|s| {
                         matches!(
                             s.status,
-                            StageStatus::Pending
-                                | StageStatus::Assigned { .. }
-                                | StageStatus::Running { .. }
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
                         )
                     });
-                if has_active_stages || all_stages_terminal {
-                    return false;
-                }
-                if matches!(record.status, JobStatus::Running { .. }) {
-                    record.status = JobStatus::Queued;
-                    record.updated_at = now;
-                    Some(record.clone())
-                } else {
-                    None
+                    let all_stages_terminal = !record.stages.is_empty()
+                        && !record.stages.iter().any(|s| {
+                            matches!(
+                                s.status,
+                                StageStatus::Pending
+                                    | StageStatus::Assigned { .. }
+                                    | StageStatus::Running { .. }
+                            )
+                        });
+                    if has_active_stages || all_stages_terminal {
+                        return false;
+                    }
+                    if matches!(record.status, JobStatus::Running { .. }) {
+                        record.status = JobStatus::Queued;
+                        record.updated_at = now;
+                        Some(record.clone())
+                    } else {
+                        None
+                    }
                 }
             } else {
                 None
             }
         };
 
+        if already_skipped {
+            self.release_in_flight_job(job_id);
+            return false;
+        }
+
         if let Some(record) = requeued_record {
             self.release_in_flight_job(job_id);
-            self.run_storage_op(|db| db.upsert_record(&record));
+            if !self.upsert_record_unless_skipped(&record).await {
+                return false;
+            }
             self.persist().await;
             self.notify.notify_waiters();
             true
@@ -1442,20 +1503,37 @@ impl JobStore {
         ) {
             self.release_in_flight_job(job_id);
         }
+        let mut already_skipped = false;
         let updated_in_store = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-                record.status = status.clone();
-                let _ = sanitize_terminal_job_stages(record);
-                record.updated_at = Utc::now();
-                Some(record.clone())
+                if matches!(record.status, JobStatus::Skipped { .. }) {
+                    already_skipped = true;
+                    None
+                } else {
+                    record.status = status.clone();
+                    let _ = sanitize_terminal_job_stages(record);
+                    record.updated_at = Utc::now();
+                    Some(record.clone())
+                }
             } else {
                 None
             }
         };
+        if already_skipped {
+            self.release_in_flight_job(job_id);
+            return;
+        }
         if let Some(record) = updated_in_store {
-            self.run_storage_op(|db| db.upsert_record(&record));
+            if !self.upsert_record_unless_skipped(&record).await {
+                self.release_in_flight_job(job_id);
+                return;
+            }
         } else if let Some(mut record) = self.run_storage_op(|db| db.get_job(job_id)) {
+            if matches!(record.status, JobStatus::Skipped { .. }) {
+                self.release_in_flight_job(job_id);
+                return;
+            }
             record.status = status;
             let _ = sanitize_terminal_job_stages(&mut record);
             record.updated_at = Utc::now();
@@ -1466,21 +1544,34 @@ impl JobStore {
     }
 
     pub async fn set_stages(&self, job_id: &str, stages: Vec<StageRecord>) {
+        let mut already_skipped = false;
         let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-                record.stages = stages;
-                record.updated_at = Utc::now();
-                Some(record.clone())
+                if matches!(record.status, JobStatus::Skipped { .. }) {
+                    already_skipped = true;
+                    None
+                } else {
+                    record.stages = stages;
+                    record.updated_at = Utc::now();
+                    Some(record.clone())
+                }
             } else {
                 None
             }
         };
-        if let Some(record) = updated {
-            self.run_storage_op(|db| db.upsert_record(&record));
+        if already_skipped {
+            self.release_in_flight_job(job_id);
+            return;
         }
-        self.persist().await;
-        self.notify.notify_waiters();
+        if let Some(record) = updated {
+            if !self.upsert_record_unless_skipped(&record).await {
+                self.release_in_flight_job(job_id);
+                return;
+            }
+            self.persist().await;
+            self.notify.notify_waiters();
+        }
     }
 
     pub async fn update_stage_status(&self, job_id: &str, stage_id: &str, status: StageStatus) {
@@ -1761,6 +1852,9 @@ impl JobStore {
         let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                if matches!(record.status, JobStatus::Skipped { .. }) {
+                    return;
+                }
                 let now = Utc::now();
                 let mut stage_updated = false;
                 for stage in record.stages.iter_mut() {
@@ -4656,5 +4750,230 @@ mod tests {
             active_rec.stages[0].status,
             StageStatus::Skipped { .. }
         ));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_skipped_job_guards_against_status_stages_requeue_and_preserves_operator_resume_restart(
+    ) {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+        let sha = "417603fa11223344556677889900aabbccddeeff";
+
+        let push_job = Job {
+            id: "job-1795064421-417603fa".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-ci-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/test-254".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: None,
+        };
+        store
+            .enqueue_job(push_job.clone(), PathBuf::from("logs/push.log"))
+            .await;
+
+        let claimed = store.claim_next_queued_job(1).await;
+        assert_eq!(claimed.map(|j| j.id), Some(push_job.id.clone()));
+        assert!(store.is_job_in_flight(&push_job.id));
+
+        let pr_job = Job {
+            id: "job-1795064423-417603fa".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/mu-ci-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/test-254".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(2),
+            pr_number: Some(246),
+        };
+        let enq = store
+            .enqueue_job(pr_job.clone(), PathBuf::from("logs/pr.log"))
+            .await;
+        assert!(!enq.ignored);
+        assert_eq!(enq.superseded_jobs, vec![push_job.id.clone()]);
+
+        // Non-explicit scheduler mutations must never resurrect a Skipped job and must release in-flight tracking.
+        store
+            .update_status(&push_job.id, JobStatus::Running { started_at: now })
+            .await;
+        assert!(!store.is_job_in_flight(&push_job.id));
+        assert!(matches!(
+            store.get_job(&push_job.id).await.unwrap().status,
+            JobStatus::Skipped { ref reason } if reason.contains("Superseded by pull_request")
+        ));
+
+        store.update_status(&push_job.id, JobStatus::Queued).await;
+        store
+            .update_status(
+                &push_job.id,
+                JobStatus::Failed {
+                    error: "stale failure".to_string(),
+                },
+            )
+            .await;
+        store
+            .update_status(
+                &push_job.id,
+                JobStatus::Completed {
+                    duration_secs: 1,
+                    exit_code: 0,
+                },
+            )
+            .await;
+        assert!(matches!(
+            store.get_job(&push_job.id).await.unwrap().status,
+            JobStatus::Skipped { ref reason } if reason.contains("Superseded by pull_request")
+        ));
+
+        store.mark_job_in_flight(&push_job.id);
+        store
+            .set_stages(
+                &push_job.id,
+                vec![StageRecord {
+                    id: "fmt-check".to_string(),
+                    name: "Fmt".to_string(),
+                    tags: vec!["fmt".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
+                }],
+            )
+            .await;
+        assert!(!store.is_job_in_flight(&push_job.id));
+        assert!(store.get_job(&push_job.id).await.unwrap().stages.is_empty());
+
+        store.mark_job_in_flight(&push_job.id);
+        assert!(!store.requeue_preserving_priority(&push_job.id).await);
+        assert!(!store.is_job_in_flight(&push_job.id));
+        assert!(matches!(
+            store.get_job(&push_job.id).await.unwrap().status,
+            JobStatus::Skipped { .. }
+        ));
+
+        // Only the pull_request job remains queued and claimable.
+        let snap = store.queue_snapshot().await;
+        assert_eq!(snap.queued_jobs.len(), 1);
+        assert_eq!(snap.queued_jobs[0].record.job.id, pr_job.id);
+        assert_eq!(
+            store.claim_next_queued_job(1).await.map(|j| j.id),
+            Some(pr_job.id)
+        );
+        assert!(store.claim_next_queued_job(1).await.is_none());
+
+        // Explicit operator resume/restart on a Skipped job remains allowed.
+        let resumed = store
+            .resume_job(&push_job.id)
+            .await
+            .expect("explicit resume on skipped job allowed");
+        assert!(matches!(resumed.status, JobStatus::Queued));
+        store
+            .enqueue_job(
+                Job {
+                    id: "job-pr-resupersede".to_string(),
+                    event_type: "pull_request".to_string(),
+                    repo_name: "LMA1980/mu-ci-controller".to_string(),
+                    clone_url: "https://github.com/LMA1980/mu-ci-controller.git".to_string(),
+                    commit_sha: sha.to_string(),
+                    ref_name: "refs/heads/feat/test-254".to_string(),
+                    sender: "LMA1980".to_string(),
+                    queued_at: now + chrono::Duration::seconds(3),
+                    pr_number: Some(247),
+                },
+                PathBuf::from("logs/pr2.log"),
+            )
+            .await;
+        // Manually set skipped again via enqueue_job wouldn't fire if pr_job is Running, so test restart directly on Skipped:
+        {
+            let mut inner = store.inner.write().await;
+            if let Some(rec) = inner.iter_mut().find(|r| r.job.id == push_job.id) {
+                rec.status = JobStatus::Skipped {
+                    reason: "Operator skipped".to_string(),
+                };
+            }
+        }
+        let restarted = store
+            .restart_job(&push_job.id)
+            .await
+            .expect("explicit restart on skipped job allowed");
+        assert!(matches!(restarted.status, JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_claim_next_queued_job_does_not_overwrite_concurrently_skipped_storage_record() {
+        let catalog = Arc::new(crate::db::CatalogStore::new());
+        let storage: Arc<dyn crate::storage_backend::ControllerStorage> =
+            Arc::new(crate::storage_backend::InMemoryStorage::new(catalog));
+        let store = JobStore::with_storage(10, None, Arc::clone(&storage));
+        let now = Utc::now();
+        let sha = "417603fa99887766554433221100ffeeddccbbaa";
+
+        let push_job = Job {
+            id: "job-push-race".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/race".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+            pr_number: None,
+        };
+        store
+            .enqueue_job(push_job.clone(), PathBuf::from("logs/push.log"))
+            .await;
+
+        // 1. Acquire claim snapshot inside inner write lock and drop the lock before storage upsert.
+        let (claimed, healed) = store.claim_next_queued_job_inner(1, None).await;
+        assert!(claimed.is_some());
+        assert!(store.is_job_in_flight(&push_job.id));
+
+        // 2. Concurrent pull_request webhook supersedes the push job during the persistence lock gap.
+        let pr_job = Job {
+            id: "job-pr-race".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/race".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(1),
+            pr_number: Some(246),
+        };
+        let enq = store
+            .enqueue_job(pr_job.clone(), PathBuf::from("logs/pr.log"))
+            .await;
+        assert_eq!(enq.superseded_jobs, vec![push_job.id.clone()]);
+
+        // 3. Stale Running snapshot persistence must abort without overwriting ControllerStorage.
+        let persisted = store.persist_claimed_and_healed(claimed, healed).await;
+        assert!(persisted.is_none());
+        assert!(!store.is_job_in_flight(&push_job.id));
+
+        assert!(matches!(
+            store.get_job(&push_job.id).await.unwrap().status,
+            JobStatus::Skipped { .. }
+        ));
+        assert!(matches!(
+            storage.get_job(&push_job.id).unwrap().status,
+            JobStatus::Skipped { .. }
+        ));
+
+        // 4. Only the winning pull_request job can be claimed next.
+        assert_eq!(
+            store.claim_next_queued_job(1).await.map(|j| j.id),
+            Some(pr_job.id)
+        );
+        assert!(store.claim_next_queued_job(1).await.is_none());
     }
 }

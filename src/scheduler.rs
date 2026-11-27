@@ -378,6 +378,29 @@ impl DAGScheduler {
         }
     }
 
+    async fn abort_if_skipped(&self, job: &Job, start_time: chrono::DateTime<Utc>) -> bool {
+        let Some(current) = self.job_store.get_job(&job.id).await else {
+            return false;
+        };
+        if let JobStatus::Skipped { ref reason } = current.status {
+            info!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                commit = %job.commit_sha,
+                reason = %reason,
+                "Aborting execution because job was already superseded or skipped"
+            );
+            self.cluster
+                .cancel_and_release_job_slots(&job.id, "Job finished, cancelled, or superseded")
+                .await;
+            self.emit_pipeline_root_span(job, &current.status, start_time);
+            self.job_store.release_in_flight_job(&job.id);
+            self.job_store.notify_event();
+            return true;
+        }
+        false
+    }
+
     async fn execute_job(&self, job: Job) {
         let mut _guard = crate::job::InFlightJobGuard::new(self.job_store.clone(), job.id.clone());
         let start_time = Utc::now();
@@ -389,6 +412,11 @@ impl DAGScheduler {
             "Starting DAG pipeline execution"
         );
 
+        if self.abort_if_skipped(&job, start_time).await {
+            _guard.disarm();
+            return;
+        }
+
         self.job_store
             .update_status(
                 &job.id,
@@ -397,6 +425,11 @@ impl DAGScheduler {
                 },
             )
             .await;
+
+        if self.abort_if_skipped(&job, start_time).await {
+            _guard.disarm();
+            return;
+        }
 
         let target_url = job_target_url(&job.id);
         self.report_github_status(
@@ -420,10 +453,19 @@ impl DAGScheduler {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
 
+        if self.abort_if_skipped(&job, start_time).await {
+            _guard.disarm();
+            return;
+        }
+
         // 1. Sync or inspect repo to resolve .actionrunner/ActionRunner.yml
         let workflow = match self.resolve_and_load_workflow(&job, &repo_workspace).await {
             Ok(wf) => wf,
             Err(err) => {
+                if self.abort_if_skipped(&job, start_time).await {
+                    _guard.disarm();
+                    return;
+                }
                 warn!(job_id = %job.id, error = %err, "Failed to load workflow; failing job");
                 let final_status = JobStatus::Failed { error: err.clone() };
                 self.job_store
@@ -482,6 +524,10 @@ impl DAGScheduler {
                     );
                 }
                 Err(err) => {
+                    if self.abort_if_skipped(&job, start_time).await {
+                        _guard.disarm();
+                        return;
+                    }
                     let err_msg = err.to_string();
                     warn!(
                         job_id = %job.id,
@@ -591,6 +637,11 @@ impl DAGScheduler {
                 .collect()
         };
 
+        if self.abort_if_skipped(&job, start_time).await {
+            _guard.disarm();
+            return;
+        }
+
         self.job_store.set_stages(&job.id, stage_records).await;
         self.cluster.set_stage_concurrency_limits(
             &job.id,
@@ -643,6 +694,7 @@ impl DAGScheduler {
                         )
                         .await;
                     self.emit_pipeline_root_span(&job, &job_record.status, start_time);
+                    self.job_store.release_in_flight_job(&job.id);
                     self.job_store.notify_event();
                     _guard.disarm();
                     break;
@@ -906,6 +958,10 @@ impl DAGScheduler {
                         self.job_store.update_metrics(&job.id, m).await;
                     }
                 }
+                if self.abort_if_skipped(&job, start_time).await {
+                    _guard.disarm();
+                    break;
+                }
                 let final_status = JobStatus::Failed {
                     error: failure_error.clone(),
                 };
@@ -1005,6 +1061,11 @@ impl DAGScheduler {
                         &gate_report,
                     );
                     self.job_store.update_metrics(&job.id, metrics).await;
+                }
+
+                if self.abort_if_skipped(&job, start_time).await {
+                    _guard.disarm();
+                    break;
                 }
 
                 self.job_store
@@ -7743,5 +7804,197 @@ not-json-line
             !trigger_post_ci_cd_pipeline_with_config(&opt_out_job, opt_out_dir.path(), &cfg).await
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_execute_job_aborts_cleanly_when_already_claimed_push_is_superseded_by_pull_request(
+    ) {
+        use axum::{
+            extract::{Path as AxumPath, State},
+            http::StatusCode,
+            routing::post,
+            Json, Router,
+        };
+        use tokio::sync::Mutex;
+
+        #[derive(Debug, Clone)]
+        struct CapturedStatus {
+            repo: String,
+            sha: String,
+            state: String,
+            target_url: String,
+        }
+
+        let captured: Arc<Mutex<Vec<CapturedStatus>>> = Arc::new(Mutex::new(Vec::new()));
+        let mock_github = Router::new()
+            .route(
+                "/repos/{owner}/{repo}/statuses/{sha}",
+                post(
+                    |State(cap): State<Arc<Mutex<Vec<CapturedStatus>>>>,
+                     AxumPath((owner, repo, sha)): AxumPath<(String, String, String)>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        cap.lock().await.push(CapturedStatus {
+                            repo: format!("{owner}/{repo}"),
+                            sha,
+                            state: body["state"].as_str().unwrap_or_default().to_string(),
+                            target_url: body["target_url"].as_str().unwrap_or_default().to_string(),
+                        });
+                        StatusCode::CREATED
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_github).await;
+        });
+
+        let workspace = tempdir().unwrap();
+        let repo_dir = workspace.path().join("repos").join("LMA1980/example");
+        std::fs::create_dir_all(repo_dir.join(".muci")).unwrap();
+        std::fs::write(
+            repo_dir.join(".muci/mu-ci.yml"),
+            r#"
+version: "3"
+name: "Supersede Regression"
+tasks:
+  opt-task:
+    tool: "cargo-check"
+    args: ["--workspace"]
+stages:
+  - id: opt-stage
+    name: "Optional Stage"
+    tasks: ["opt-task"]
+    tags: ["missing-capability"]
+    if_unavailable:
+      policy: "skip"
+on_action:
+  push: ["opt-stage"]
+  pull_request: ["opt-stage"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            github_token: Some(format!("ghs_unit_test_tok@http://{addr}")),
+            max_concurrent_jobs: 1,
+            ..Config::default()
+        };
+        let job_store = JobStore::new(10, None);
+        let cluster = ClusterRegistry::new();
+        let (worker_tx, _worker_rx) = tokio::sync::mpsc::channel(8);
+        cluster
+            .register(
+                mu_ci_ipc::WorkerRegistration {
+                    node_id: "node-a".to_string(),
+                    arch: "x86_64".to_string(),
+                    tags: vec!["x86_64".to_string()],
+                    max_slots: 1,
+                    ram_total_mb: 32768,
+                    btrfs_enabled: false,
+                    toolchains: vec!["stable".to_string()],
+                    rust_semver: None,
+                },
+                worker_tx,
+            )
+            .await;
+        let scheduler = DAGScheduler::new(config, job_store.clone(), cluster.clone());
+
+        let now = Utc::now();
+        let sha = "417603fa11223344556677889900aabbccddeeff";
+        let push_job = Job {
+            id: "job-1795064421-417603fa".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/supersede".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: None,
+            queued_at: now,
+        };
+        job_store
+            .enqueue_job(push_job.clone(), std::path::PathBuf::from("logs/push.log"))
+            .await;
+
+        let claimed_push = job_store
+            .claim_next_queued_job_for_cluster(1, Some(&cluster))
+            .await
+            .expect("push job should be claimed");
+        assert_eq!(claimed_push.id, push_job.id);
+
+        // Supersede the already-claimed push job with a pull_request webhook before execute_job enters its DAG loop.
+        let pr_job = Job {
+            id: "job-1795064423-417603fa".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/example".to_string(),
+            clone_url: "https://github.com/LMA1980/example.git".to_string(),
+            commit_sha: sha.to_string(),
+            ref_name: "refs/heads/feat/supersede".to_string(),
+            sender: "LMA1980".to_string(),
+            pr_number: Some(246),
+            queued_at: now + chrono::Duration::seconds(2),
+        };
+        let enq = job_store
+            .enqueue_job(pr_job.clone(), std::path::PathBuf::from("logs/pr.log"))
+            .await;
+        assert!(!enq.ignored);
+        assert_eq!(enq.superseded_jobs, vec![push_job.id.clone()]);
+
+        // Executing the superseded push job must abort cleanly without resurrection or emitting commit statuses.
+        scheduler.execute_job(claimed_push).await;
+
+        assert!(
+            captured.lock().await.is_empty(),
+            "superseded push job must emit zero pending/running GitHub commit statuses"
+        );
+        let push_rec = job_store.get_job(&push_job.id).await.unwrap();
+        assert!(
+            matches!(
+                push_rec.status,
+                JobStatus::Skipped { ref reason } if reason.contains("Superseded by pull_request")
+            ),
+            "expected push job to remain Skipped, got {:?}",
+            push_rec.status
+        );
+        assert!(push_rec.stages.is_empty());
+        assert!(!job_store.is_job_in_flight(&push_job.id));
+
+        let snap = job_store.queue_snapshot().await;
+        assert_eq!(snap.active_jobs.len(), 0);
+        assert_eq!(snap.queued_jobs.len(), 1);
+        assert_eq!(snap.queued_jobs[0].record.job.id, pr_job.id);
+
+        // Only the winning pull_request job is claimed and executed.
+        let claimed_pr = job_store
+            .claim_next_queued_job_for_cluster(1, Some(&cluster))
+            .await
+            .expect("pull_request job should be claimed");
+        assert_eq!(claimed_pr.id, pr_job.id);
+        assert!(job_store
+            .claim_next_queued_job_for_cluster(1, Some(&cluster))
+            .await
+            .is_none());
+
+        scheduler.execute_job(claimed_pr).await;
+
+        let pr_rec = job_store.get_job(&pr_job.id).await.unwrap();
+        assert!(
+            matches!(pr_rec.status, JobStatus::Completed { exit_code: 0, .. }),
+            "expected pull_request job to complete cleanly, got {:?}",
+            pr_rec.status
+        );
+        let events = captured.lock().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].repo, "LMA1980/example");
+        assert_eq!(events[0].sha, sha);
+        assert_eq!(events[0].state, "pending");
+        assert!(events[0].target_url.ends_with(&pr_job.id));
+        assert_eq!(events[1].state, "success");
+        assert!(events[1].target_url.ends_with(&pr_job.id));
     }
 }
