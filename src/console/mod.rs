@@ -283,6 +283,7 @@ pub enum ConsoleEventKind {
     PrStateChanged,
     JobStageChanged,
     NodeMembershipChanged,
+    ReposChanged,
 }
 
 impl ConsoleEventKind {
@@ -294,6 +295,7 @@ impl ConsoleEventKind {
             Self::PrStateChanged => "pr_state_changed",
             Self::JobStageChanged => "job_stage_changed",
             Self::NodeMembershipChanged => "node_membership_changed",
+            Self::ReposChanged => "repos_changed",
         }
     }
 }
@@ -304,6 +306,10 @@ pub struct ConsoleEvent {
     /// `true` when the event may be delivered to anonymous subscribers.
     pub public: bool,
     pub data: Value,
+    /// Optional redacted payload for unauthenticated subscribers when `data`
+    /// contains non-public identifiers (e.g. mixed `prune_repos` batches or
+    /// visibility-crossing renames).
+    pub public_data: Option<Value>,
 }
 
 // ============================================================================
@@ -549,27 +555,60 @@ impl ConsoleState {
     }
 
     /// Marks `owner/repo` as retired, evicts it from active `repos`, bumps `fabric_rev`,
-    /// and persists `Registry` (leaving historical jobs in `JobStore` / `MuObserve` untouched).
+    /// emits `repos_changed` (`reason = "retired"`), and persists `Registry` (leaving
+    /// historical jobs in `JobStore` / `MuObserve` untouched).
     /// Returns `true` when registry state changed.
     pub async fn retire_repo(&self, owner: &str, repo: &str) -> bool {
+        self.retire_repo_with_reason(owner, repo, "retired", None)
+            .await
+    }
+
+    async fn retire_repo_with_reason(
+        &self,
+        owner: &str,
+        repo: &str,
+        reason: &str,
+        payload_visibility: Option<Visibility>,
+    ) -> bool {
         let full = format!("{owner}/{repo}");
         if !is_safe_repo_name(&full) {
             return false;
         }
         let key = repo_key(owner, repo);
-        let changed = {
+        let event = {
             let mut reg = self.0.registry.write().await;
+            let existing = reg.repos.get(&key);
+            let public = match existing.and_then(|e| e.visibility).or(payload_visibility) {
+                Some(Visibility::Public) => payload_visibility
+                    .map(|v| v == Visibility::Public)
+                    .unwrap_or(true),
+                _ => false,
+            };
+            let (ev_owner, ev_repo) = existing
+                .map(|e| (e.owner.clone(), e.repo.clone()))
+                .unwrap_or_else(|| (owner.to_string(), repo.to_string()));
             if reg.retire_key(key, Utc::now()) {
-                reg.bump();
-                true
+                let rev = reg.bump();
+                Some((
+                    public,
+                    json!({
+                        "owner": ev_owner,
+                        "repo": ev_repo,
+                        "reason": reason,
+                        "fabric_rev": rev,
+                    }),
+                ))
             } else {
-                false
+                None
             }
         };
-        if changed {
+        if let Some((public, data)) = event {
+            self.emit(ConsoleEventKind::ReposChanged, public, data);
             self.persist().await;
+            true
+        } else {
+            false
         }
-        changed
     }
 
     /// Probes all currently known active repositories against GitHub (when configured),
@@ -626,22 +665,53 @@ impl ConsoleState {
             return Vec::new();
         }
 
-        let retired_list = {
+        let (retired_list, event) = {
             let mut reg = self.0.registry.write().await;
             let now = Utc::now();
             let mut retired = Vec::new();
+            let mut public_retired = Vec::new();
+            let mut any_non_public = false;
             for (key, display) in to_retire {
+                let is_pub = reg
+                    .repos
+                    .get(&key)
+                    .map(RepoEntry::is_public)
+                    .unwrap_or(false);
                 if reg.retire_key(key, now) {
-                    retired.push(display);
+                    retired.push(display.clone());
+                    if is_pub {
+                        public_retired.push(display);
+                    } else {
+                        any_non_public = true;
+                    }
                 }
             }
-            if !retired.is_empty() {
-                reg.bump();
-            }
-            retired
+            let event = if !retired.is_empty() {
+                let rev = reg.bump();
+                let any_public = !public_retired.is_empty();
+                let data = json!({
+                    "reason": "pruned",
+                    "pruned_count": retired.len(),
+                    "repos": retired,
+                    "fabric_rev": rev,
+                });
+                let public_data = (any_public && any_non_public).then(|| {
+                    json!({
+                        "reason": "pruned",
+                        "pruned_count": public_retired.len(),
+                        "repos": public_retired,
+                        "fabric_rev": rev,
+                    })
+                });
+                Some((any_public, data, public_data))
+            } else {
+                None
+            };
+            (retired, event)
         };
 
-        if !retired_list.is_empty() {
+        if let Some((public, data, public_data)) = event {
+            self.emit_with_public_data(ConsoleEventKind::ReposChanged, public, data, public_data);
             self.persist().await;
         }
         retired_list
@@ -653,7 +723,22 @@ impl ConsoleState {
     }
 
     fn emit(&self, kind: ConsoleEventKind, public: bool, data: Value) {
-        let _ = self.0.events.send(ConsoleEvent { kind, public, data });
+        self.emit_with_public_data(kind, public, data, None);
+    }
+
+    fn emit_with_public_data(
+        &self,
+        kind: ConsoleEventKind,
+        public: bool,
+        data: Value,
+        public_data: Option<Value>,
+    ) {
+        let _ = self.0.events.send(ConsoleEvent {
+            kind,
+            public,
+            data,
+            public_data,
+        });
     }
 
     async fn persist(&self) {
@@ -706,27 +791,29 @@ impl ConsoleState {
         };
         let key = repo_key(owner, repo);
         let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
+        let repo_obj = payload.get("repository").cloned().unwrap_or(Value::Null);
+        let visibility = Visibility::from_repository(&repo_obj);
         if event == "repository" && action == "deleted" {
-            let _ = self.retire_repo(owner, repo).await;
+            let _ = self
+                .retire_repo_with_reason(owner, repo, "deleted", visibility)
+                .await;
             return;
         }
-        if event == "repository" && action == "renamed" {
-            if let Some(old_name) = payload
+        let renamed_from = if event == "repository" && action == "renamed" {
+            payload
                 .pointer("/changes/repository/name/from")
                 .and_then(Value::as_str)
                 .map(str::trim)
-            {
-                if !old_name.is_empty()
-                    && !old_name.eq_ignore_ascii_case(repo)
-                    && is_safe_repo_name(&format!("{owner}/{old_name}"))
-                {
-                    let _ = self.retire_repo(owner, old_name).await;
-                }
-            }
-        }
+                .filter(|old_name| {
+                    !old_name.is_empty()
+                        && !old_name.eq_ignore_ascii_case(repo)
+                        && is_safe_repo_name(&format!("{owner}/{old_name}"))
+                })
+                .map(str::to_string)
+        } else {
+            None
+        };
 
-        let repo_obj = payload.get("repository").cloned().unwrap_or(Value::Null);
-        let visibility = Visibility::from_repository(&repo_obj);
         let payload_default = repo_obj
             .get("default_branch")
             .and_then(Value::as_str)
@@ -738,16 +825,31 @@ impl ConsoleState {
             || (event == "repository" && matches!(action, "created" | "unarchived" | "renamed"));
 
         let jobs = job_store.list_jobs().await;
-        let mut pending: Vec<(ConsoleEventKind, Value)> = Vec::new();
+        let mut pending: Vec<(ConsoleEventKind, bool, Value, Option<Value>)> = Vec::new();
         let mut refresh: Option<Option<String>> = None;
-        let public;
         let mut changed = false;
 
         {
             let mut reg = self.0.registry.write().await;
+            let mut old_public = false;
+            if let Some(ref old_name) = renamed_from {
+                let old_key = repo_key(owner, old_name);
+                old_public = reg
+                    .repos
+                    .get(&old_key)
+                    .map(RepoEntry::is_public)
+                    .unwrap_or(false);
+                if reg.retire_key(old_key, Utc::now()) {
+                    changed = true;
+                }
+            }
             let mut unretired = false;
             if reg.retired_repos.contains_key(&key) {
                 if !should_unretire {
+                    if changed {
+                        drop(reg);
+                        self.persist().await;
+                    }
                     return;
                 }
                 reg.retired_repos.remove(&key);
@@ -755,6 +857,11 @@ impl ConsoleState {
                 unretired = true;
             }
             let is_new_repo = !reg.repos.contains_key(&key);
+            let prev_public = reg
+                .repos
+                .get(&key)
+                .map(RepoEntry::is_public)
+                .unwrap_or(false);
             let entry = reg
                 .repos
                 .entry(key)
@@ -770,9 +877,81 @@ impl ConsoleState {
                 entry.default_branch = payload_default.clone();
                 changed = true;
             }
+            let now_public = entry.is_public();
+            let entry_owner = entry.owner.clone();
+            let entry_repo = entry.repo.clone();
             let default_branch = entry.default_branch().to_string();
             let fork_stage = main_line_station(&jobs, full, &default_branch);
 
+            let repos_changed_event = if event == "repository" && action == "renamed" {
+                changed = true;
+                let mut data = json!({
+                    "owner": entry_owner,
+                    "repo": entry_repo,
+                    "reason": "renamed",
+                });
+                if let Some(ref old_name) = renamed_from {
+                    data["previous_repo"] = json!(old_name);
+                }
+                let (ev_public, public_data) = match (old_public, now_public) {
+                    (true, true) => (true, None),
+                    (false, false) => (false, None),
+                    (false, true) => (
+                        true,
+                        Some(json!({
+                            "owner": entry_owner,
+                            "repo": entry_repo,
+                            "reason": "renamed",
+                        })),
+                    ),
+                    (true, false) => (true, Some(json!({ "reason": "catalog_updated" }))),
+                };
+                Some((ConsoleEventKind::ReposChanged, ev_public, data, public_data))
+            } else if event == "repository" && action == "unarchived" {
+                changed = true;
+                Some((
+                    ConsoleEventKind::ReposChanged,
+                    now_public,
+                    json!({
+                        "owner": entry_owner,
+                        "repo": entry_repo,
+                        "reason": "unarchived",
+                    }),
+                    None,
+                ))
+            } else if event == "repository" && action == "created" {
+                changed = true;
+                Some((
+                    ConsoleEventKind::ReposChanged,
+                    now_public,
+                    json!({
+                        "owner": entry_owner,
+                        "repo": entry_repo,
+                        "reason": "created",
+                    }),
+                    None,
+                ))
+            } else if is_new_repo || unretired || prev_public != now_public {
+                changed = true;
+                let data = json!({
+                    "owner": entry_owner,
+                    "repo": entry_repo,
+                    "reason": "discovered",
+                });
+                let (ev_public, public_data) = if !is_new_repo && prev_public && !now_public {
+                    (true, Some(json!({ "reason": "catalog_updated" })))
+                } else {
+                    (now_public, None)
+                };
+                Some((ConsoleEventKind::ReposChanged, ev_public, data, public_data))
+            } else {
+                None
+            };
+            if let Some(ev) = repos_changed_event {
+                pending.push(ev);
+            }
+
+            let mut branch_or_pr: Vec<(ConsoleEventKind, Value)> = Vec::new();
             match event {
                 "create" | "delete" => {
                     let is_branch =
@@ -785,7 +964,7 @@ impl ConsoleState {
                         } else {
                             branch_deleted(entry, &r)
                         };
-                        pending.extend(ev);
+                        branch_or_pr.extend(ev);
                     }
                 }
                 "push" => {
@@ -798,7 +977,7 @@ impl ConsoleState {
                             .unwrap_or(false)
                             || after == ZERO_SHA;
                         if deleted {
-                            pending.extend(branch_deleted(entry, branch));
+                            branch_or_pr.extend(branch_deleted(entry, branch));
                         } else if branch == default_branch {
                             if push_touches_topology(payload, &entry.submodules)
                                 || entry.submodules_ref.is_none()
@@ -816,7 +995,7 @@ impl ConsoleState {
                                 b.updated_at = Utc::now();
                                 changed = true;
                             } else if created || branch.starts_with("feat/") {
-                                pending.extend(branch_created(
+                                branch_or_pr.extend(branch_created(
                                     entry,
                                     branch,
                                     &default_branch,
@@ -829,7 +1008,7 @@ impl ConsoleState {
                     }
                 }
                 "pull_request" => {
-                    pending.extend(observe_pull_request(
+                    branch_or_pr.extend(observe_pull_request(
                         entry,
                         payload,
                         full,
@@ -843,22 +1022,23 @@ impl ConsoleState {
             if refresh.is_none() && entry.is_stale(self.0.cfg.metadata_ttl) {
                 refresh = Some(None);
             }
-            public = entry.is_public();
-            if !pending.is_empty() {
+            let entry_public = entry.is_public();
+            for (kind, data) in branch_or_pr {
+                pending.push((kind, entry_public, data, None));
                 changed = true;
             }
-            if pending.is_empty() && (unretired || (is_new_repo && event == "repository")) {
-                reg.bump();
-            }
-            for (_, data) in pending.iter_mut() {
+            for (_, _, data, public_data) in pending.iter_mut() {
                 let rev = reg.bump();
                 data["fabric_rev"] = json!(rev);
+                if let Some(pd) = public_data {
+                    pd["fabric_rev"] = json!(rev);
+                }
             }
         }
 
-        for (kind, data) in pending {
+        for (kind, ev_public, data, public_data) in pending {
             debug!(kind = kind.as_str(), "Console event");
-            self.emit(kind, public, data);
+            self.emit_with_public_data(kind, ev_public, data, public_data);
         }
         if changed {
             self.persist().await;
@@ -1024,15 +1204,21 @@ impl ConsoleState {
             }
         }
 
-        let retired_now = {
+        let (retired_now, discovered_event) = {
             let mut reg = self.0.registry.write().await;
             if reg.retired_repos.contains_key(&key) {
                 let removed = reg.repos.remove(&key).is_some();
                 if removed {
                     reg.bump();
                 }
-                Some(removed)
+                (Some(removed), None)
             } else {
+                let is_new_repo = !reg.repos.contains_key(&key);
+                let prev_public = reg
+                    .repos
+                    .get(&key)
+                    .map(RepoEntry::is_public)
+                    .unwrap_or(false);
                 let entry = reg
                     .repos
                     .entry(key.clone())
@@ -1054,10 +1240,37 @@ impl ConsoleState {
                     entry.stations = st;
                 }
                 entry.metadata_refreshed_at = Some(Utc::now());
-                if graph_changed {
-                    reg.bump();
-                }
-                None
+                let now_public = entry.is_public();
+                let entry_owner = entry.owner.clone();
+                let entry_repo = entry.repo.clone();
+                let discovered = is_new_repo || prev_public != now_public;
+                let discovered_event = if discovered {
+                    let rev = reg.bump();
+                    let data = json!({
+                        "owner": entry_owner,
+                        "repo": entry_repo,
+                        "reason": "discovered",
+                        "fabric_rev": rev,
+                    });
+                    let (ev_public, public_data) = if !is_new_repo && prev_public && !now_public {
+                        (
+                            true,
+                            Some(json!({
+                                "reason": "catalog_updated",
+                                "fabric_rev": rev,
+                            })),
+                        )
+                    } else {
+                        (now_public, None)
+                    };
+                    Some((ev_public, data, public_data))
+                } else {
+                    if graph_changed {
+                        reg.bump();
+                    }
+                    None
+                };
+                (None, discovered_event)
             }
         };
         if let Some(removed) = retired_now {
@@ -1065,6 +1278,9 @@ impl ConsoleState {
                 self.persist().await;
             }
             return;
+        }
+        if let Some((public, data, public_data)) = discovered_event {
+            self.emit_with_public_data(ConsoleEventKind::ReposChanged, public, data, public_data);
         }
         info!(repo = %key, git_ref = %git_ref, "Console repository metadata refreshed");
         self.persist().await;

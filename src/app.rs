@@ -1685,7 +1685,8 @@ pub async fn handle_events(
     }
 
     let authenticated = eval.has_policy("ci:jobs.read");
-    stream_dashboard_events(state, authenticated)
+    let can_read_private_repos = eval.has_policy("ci:repos.private.read");
+    stream_dashboard_events(state, authenticated, can_read_private_repos)
 }
 
 pub async fn handle_job_events(
@@ -1703,11 +1704,81 @@ pub async fn handle_job_events(
     stream_job_events(state, job_id, is_operator).await
 }
 
+async fn sanitize_public_repos_changed(
+    state: &AppState,
+    mut data: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let rev = data.get("fabric_rev").cloned();
+    let redacted = || {
+        let mut out = serde_json::json!({ "reason": "catalog_updated" });
+        if let Some(ref r) = rev {
+            out["fabric_rev"] = r.clone();
+        }
+        out
+    };
+    if let (Some(owner), Some(repo)) = (
+        data.get("owner").and_then(|v| v.as_str()),
+        data.get("repo").and_then(|v| v.as_str()),
+    ) {
+        if let Some(entry) = state.console.entry(owner, repo).await {
+            if !entry.is_public() {
+                return Some(redacted());
+            }
+        }
+        if let Some(prev) = data
+            .get("previous_repo")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        {
+            if let Some(prev_entry) = state.console.entry(owner, &prev).await {
+                if !prev_entry.is_public() {
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.remove("previous_repo");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(repos_arr) = data.get("repos").and_then(|v| v.as_array()).cloned() {
+        let mut filtered = Vec::with_capacity(repos_arr.len());
+        let mut removed_any = false;
+        for item in repos_arr {
+            let Some(full) = item.as_str() else {
+                removed_any = true;
+                continue;
+            };
+            let Some((owner, repo)) = full.split_once('/') else {
+                removed_any = true;
+                continue;
+            };
+            if let Some(entry) = state.console.entry(owner, repo).await {
+                if !entry.is_public() {
+                    removed_any = true;
+                    continue;
+                }
+            }
+            filtered.push(item);
+        }
+        if removed_any {
+            if filtered.is_empty() {
+                return None;
+            }
+            data["pruned_count"] = serde_json::json!(filtered.len());
+            data["repos"] = serde_json::Value::Array(filtered);
+        }
+    }
+    Some(data)
+}
+
 /// Dashboard SSE stream. Existing kinds (`queue`, `jobs`, `cluster`) are unchanged; the
 /// additive console kinds (`branch_created`, `branch_deleted`, `pr_state_changed`,
-/// `job_stage_changed`, `node_membership_changed`) are interleaved as they occur.
+/// `job_stage_changed`, `node_membership_changed`, `repos_changed`) are interleaved as they occur.
 /// Console events about private repositories are only sent to authenticated streams.
-fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Response {
+fn stream_dashboard_events(
+    state: Arc<AppState>,
+    authenticated: bool,
+    can_read_private_repos: bool,
+) -> Response {
     let mut console_rx = state.console.subscribe();
     let stream = async_stream::stream! {
         // 1. Initial snapshot push
@@ -1769,8 +1840,27 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
                 recv = console_rx.recv(), if console_open => {
                     match recv {
                         Ok(ev) => {
-                            if ev.public || authenticated {
-                                let mut data = ev.data;
+                            let allow_private = if ev.kind == crate::console::ConsoleEventKind::ReposChanged {
+                                authenticated && can_read_private_repos
+                            } else {
+                                authenticated
+                            };
+                            if ev.public || allow_private {
+                                let mut data = if allow_private {
+                                    ev.data
+                                } else {
+                                    ev.public_data.unwrap_or(ev.data)
+                                };
+                                if !allow_private
+                                    && ev.kind == crate::console::ConsoleEventKind::ReposChanged
+                                {
+                                    let Some(sanitized) =
+                                        sanitize_public_repos_changed(&state, data).await
+                                    else {
+                                        continue;
+                                    };
+                                    data = sanitized;
+                                }
                                 if !authenticated {
                                     if let Some(node_id) = data.get("node_id").and_then(|v| v.as_str()) {
                                         data["node_id"] = serde_json::json!(sanitize_public_node_id(node_id));

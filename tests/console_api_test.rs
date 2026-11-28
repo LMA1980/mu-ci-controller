@@ -3039,3 +3039,557 @@ async fn redirected_renamed_github_repo_full_name_mismatch_auto_retires_in_refre
     assert!(find_repo(&repos_json, "ActionRunner-controller").is_none());
     assert!(find_repo(&repos_json, "mu-ci-controller").is_some());
 }
+
+fn all_frame_data(acc: &str, kind: &str) -> Vec<Value> {
+    let needle = format!("event: {kind}\n");
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while let Some(pos) = acc[offset..].find(&needle) {
+        let start = offset + pos + needle.len();
+        if let Some(line) = acc[start..].lines().find(|l| l.starts_with("data: ")) {
+            if let Ok(val) = serde_json::from_str::<Value>(&line["data: ".len()..]) {
+                out.push(val);
+            }
+        }
+        offset = start;
+    }
+    out
+}
+
+async fn read_until_count<S>(stream: &mut S, kind: &str, count: usize) -> String
+where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+{
+    let mut acc = String::new();
+    let needle = format!("event: {kind}\n");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while acc.matches(&needle).count() < count {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for {count} `{kind}` frames (got {}):\n{acc}",
+                    acc.matches(&needle).count()
+                )
+            })
+            .expect("stream ended")
+            .expect("stream error");
+        acc.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    acc
+}
+
+#[tokio::test]
+async fn sse_repos_changed_on_catalog_mutations_and_private_confidentiality() {
+    let mut initial_repos: BTreeMap<String, Value> = BTreeMap::new();
+    for (name, private) in [
+        ("LMA1980/priv-created", true),
+        ("LMA1980/pub-created", false),
+        ("LMA1980/priv-renamed", true),
+        ("LMA1980/pub-from-priv", false),
+        ("LMA1980/pub-renamed", false),
+        ("LMA1980/priv-after-pub", true),
+        ("LMA1980/priv-push", true),
+        ("LMA1980/pub-push", false),
+        ("LMA1980/refreshed-pub", false),
+        ("LMA1980/pub-404-gone", false),
+        ("LMA1980/priv-404-gone", true),
+        ("LMA1980/pub-redirect-old", false),
+        ("LMA1980/priv-batch-prune", true),
+    ] {
+        initial_repos.insert(
+            name.to_string(),
+            json!({
+                "private": private,
+                "visibility": if private { "private" } else { "public" },
+                "default_branch": "main"
+            }),
+        );
+    }
+    let mock_repos = Arc::new(tokio::sync::RwLock::new(initial_repos));
+    let mock_app = Router::new()
+        .route(
+            "/repos/{owner}/{repo}",
+            get({
+                let repos = mock_repos.clone();
+                move |axum::extract::Path((o, r)): axum::extract::Path<(String, String)>| {
+                    let repos = repos.clone();
+                    async move {
+                        let guard = repos.read().await;
+                        match guard.get(&format!("{o}/{r}")) {
+                            Some(v) => (StatusCode::OK, v.to_string()),
+                            None => (StatusCode::NOT_FOUND, "{}".to_string()),
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/{owner}/{repo}/contents/{*path}",
+            get(|| async { (StatusCode::NOT_FOUND, "{}".to_string()) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    let api_url = format!("http://{addr}");
+
+    let console = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api_url),
+        github_token: Some("ghp_test_token".to_string()),
+        ..ConsoleConfig::default()
+    });
+    let mut cfg = test_config(Some(API_KEY));
+    cfg.proxy_secret = Some(PROXY_SECRET.to_string());
+    cfg.github_token = Some("ghp_test_token".to_string());
+    let job_store = JobStore::new(100, None);
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console,
+    });
+    let app = create_router(state.clone());
+
+    // Connect both anonymous and authenticated /api/events streams simultaneously.
+    let anon_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon_resp.status(), StatusCode::OK);
+    let mut anon_stream = anon_resp.into_body().into_data_stream();
+    read_until(&mut anon_stream, "cluster").await;
+
+    let auth_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/events?token={API_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth_resp.status(), StatusCode::OK);
+    let mut auth_stream = auth_resp.into_body().into_data_stream();
+    read_until(&mut auth_stream, "cluster").await;
+
+    let bearer_auth = format!("Bearer {API_KEY}");
+    let api_hdrs = [("Authorization", bearer_auth.as_str())];
+
+    // 1. repository created (private then public)
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "created", "repository": repo_obj("LMA1980/priv-created", true)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "created", "repository": repo_obj("LMA1980/pub-created", false)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // 2. repository renamed:
+    //    - private -> private
+    //    - private -> public
+    //    - public -> public
+    //    - public -> private
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({
+                "action": "renamed",
+                "repository": repo_obj("LMA1980/priv-renamed", true),
+                "changes": {"repository": {"name": {"from": "priv-created"}}}
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({
+                "action": "renamed",
+                "repository": repo_obj("LMA1980/pub-from-priv", false),
+                "changes": {"repository": {"name": {"from": "priv-renamed"}}}
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({
+                "action": "renamed",
+                "repository": repo_obj("LMA1980/pub-renamed", false),
+                "changes": {"repository": {"name": {"from": "pub-created"}}}
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({
+                "action": "renamed",
+                "repository": repo_obj("LMA1980/priv-after-pub", true),
+                "changes": {"repository": {"name": {"from": "pub-renamed"}}}
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // 3. DELETE /api/repos/{owner}/{repo} (private, public, and idempotent repeat)
+    let (st, _, _) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/priv-after-pub",
+        &api_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/pub-from-priv",
+        &api_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let rev_before_noop = state.console.fabric_rev().await;
+    let (st, _, _) = send_req(
+        &app,
+        "DELETE",
+        "/api/repos/LMA1980/pub-from-priv",
+        &api_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(state.console.fabric_rev().await, rev_before_noop);
+
+    // 4. repository unarchived + repository deleted (private then public)
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "unarchived", "repository": repo_obj("LMA1980/priv-after-pub", true)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "unarchived", "repository": repo_obj("LMA1980/pub-from-priv", false)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "deleted", "repository": repo_obj("LMA1980/priv-after-pub", true)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "repository",
+            json!({"action": "deleted", "repository": repo_obj("LMA1980/pub-from-priv", false)}),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // 5. First-seen push discovery (private, public, and repeat public push which must NOT emit)
+    assert_eq!(
+        post_webhook(
+            &app,
+            "push",
+            json!({
+                "ref": "refs/heads/main",
+                "after": SHA_SECRET,
+                "repository": repo_obj("LMA1980/priv-push", true),
+            }),
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "push",
+            json!({
+                "ref": "refs/heads/main",
+                "after": SHA_CHILD,
+                "repository": repo_obj("LMA1980/pub-push", false),
+            }),
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        post_webhook(
+            &app,
+            "push",
+            json!({
+                "ref": "refs/heads/main",
+                "after": SHA_CORE,
+                "repository": repo_obj("LMA1980/pub-push", false),
+            }),
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+
+    // 6. refresh_repo discovery + repeat refresh (no spam) + authenticated 404 & #236 redirect auto-retirement
+    state
+        .console
+        .refresh_repo("LMA1980", "refreshed-pub", None)
+        .await;
+    state
+        .console
+        .refresh_repo("LMA1980", "refreshed-pub", None)
+        .await;
+
+    // Seed repos via refresh_repo while active in mock GitHub, then delete/redirect them.
+    state
+        .console
+        .refresh_repo("LMA1980", "pub-404-gone", None)
+        .await;
+    state
+        .console
+        .refresh_repo("LMA1980", "priv-404-gone", None)
+        .await;
+    state
+        .console
+        .refresh_repo("LMA1980", "pub-redirect-old", None)
+        .await;
+    {
+        let mut guard = mock_repos.write().await;
+        guard.remove("LMA1980/pub-404-gone");
+        guard.remove("LMA1980/priv-404-gone");
+        guard.insert(
+            "LMA1980/pub-redirect-old".to_string(),
+            json!({"full_name": "LMA1980/refreshed-pub", "private": false, "visibility": "public", "default_branch": "main"}),
+        );
+    }
+    state
+        .console
+        .refresh_repo("LMA1980", "pub-404-gone", None)
+        .await;
+    state
+        .console
+        .refresh_repo("LMA1980", "priv-404-gone", None)
+        .await;
+    state
+        .console
+        .refresh_repo("LMA1980", "pub-redirect-old", None)
+        .await;
+
+    // 7. POST /api/repos/prune: empty, private-only, and mixed (public + private)
+    let rev_before_empty_prune = state.console.fabric_rev().await;
+    let (st, empty_prune, _) =
+        send_req(&app, "POST", "/api/repos/prune", &api_hdrs, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(empty_prune["retired"], json!([]));
+    assert_eq!(state.console.fabric_rev().await, rev_before_empty_prune);
+
+    let (st, priv_prune, _) = send_req(
+        &app,
+        "POST",
+        "/api/repos/prune",
+        &api_hdrs,
+        Some(json!({"repos": ["LMA1980/priv-push"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(priv_prune["retired"], json!(["LMA1980/priv-push"]));
+
+    // Ensure priv-batch-prune is cached as private in console registry before mixed prune
+    state
+        .console
+        .refresh_repo("LMA1980", "priv-batch-prune", None)
+        .await;
+
+    let (st, mixed_prune, _) = send_req(
+        &app,
+        "POST",
+        "/api/repos/prune",
+        &api_hdrs,
+        Some(json!({"repos": ["LMA1980/pub-push", "LMA1980/priv-batch-prune"]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        mixed_prune["retired"],
+        json!(["LMA1980/priv-batch-prune", "LMA1980/pub-push"])
+    );
+
+    // Expected authenticated repos_changed count:
+    // 1: created priv-created
+    // 2: created pub-created
+    // 3: renamed priv-created -> priv-renamed
+    // 4: renamed priv-renamed -> pub-from-priv
+    // 5: renamed pub-created -> pub-renamed
+    // 6: renamed pub-renamed -> priv-after-pub
+    // 7: retired priv-after-pub (DELETE)
+    // 8: retired pub-from-priv (DELETE)
+    // 9: unarchived priv-after-pub
+    // 10: unarchived pub-from-priv
+    // 11: deleted priv-after-pub
+    // 12: deleted pub-from-priv
+    // 13: discovered priv-push (push)
+    // 14: discovered pub-push (push)
+    // 15: discovered refreshed-pub (refresh_repo)
+    // 16: discovered pub-404-gone (refresh_repo)
+    // 17: discovered priv-404-gone (refresh_repo)
+    // 18: discovered pub-redirect-old (refresh_repo)
+    // 19: retired pub-404-gone (refresh_repo 404)
+    // 20: retired priv-404-gone (refresh_repo 404)
+    // 21: retired pub-redirect-old (refresh_repo #236 redirect)
+    // 22: pruned priv-push
+    // 23: discovered priv-batch-prune (refresh_repo)
+    // 24: pruned mixed (priv-batch-prune + pub-push)
+    let auth_acc = read_until_count(&mut auth_stream, "repos_changed", 24).await;
+    let auth_events = all_frame_data(&auth_acc, "repos_changed");
+    assert_eq!(auth_events.len(), 24);
+
+    let mut prev_rev = 0;
+    for ev in &auth_events {
+        let rev = ev["fabric_rev"].as_u64().unwrap();
+        assert!(rev > prev_rev, "non-monotonic fabric_rev in auth: {ev}");
+        prev_rev = rev;
+    }
+
+    assert_eq!(auth_events[0]["reason"], "created");
+    assert_eq!(auth_events[0]["repo"], "priv-created");
+    assert_eq!(auth_events[2]["reason"], "renamed");
+    assert_eq!(auth_events[2]["repo"], "priv-renamed");
+    assert_eq!(auth_events[2]["previous_repo"], "priv-created");
+    assert_eq!(auth_events[3]["reason"], "renamed");
+    assert_eq!(auth_events[3]["repo"], "pub-from-priv");
+    assert_eq!(auth_events[3]["previous_repo"], "priv-renamed");
+    assert_eq!(auth_events[6]["reason"], "retired");
+    assert_eq!(auth_events[6]["repo"], "priv-after-pub");
+    assert_eq!(auth_events[8]["reason"], "unarchived");
+    assert_eq!(auth_events[10]["reason"], "deleted");
+    assert_eq!(auth_events[10]["repo"], "priv-after-pub");
+    assert_eq!(auth_events[12]["reason"], "discovered");
+    assert_eq!(auth_events[12]["repo"], "priv-push");
+    assert_eq!(auth_events[19]["reason"], "retired");
+    assert_eq!(auth_events[19]["repo"], "priv-404-gone");
+    assert_eq!(auth_events[20]["reason"], "retired");
+    assert_eq!(auth_events[20]["repo"], "pub-redirect-old");
+    assert_eq!(auth_events[21]["reason"], "pruned");
+    assert_eq!(auth_events[21]["pruned_count"], 1);
+    assert_eq!(auth_events[23]["reason"], "pruned");
+    assert_eq!(auth_events[23]["pruned_count"], 2);
+    assert_eq!(
+        auth_events[23]["repos"],
+        json!(["LMA1980/priv-batch-prune", "LMA1980/pub-push"])
+    );
+
+    // Expected anonymous repos_changed count (only public / redacted cross-boundary events):
+    // 1: created pub-created
+    // 2: renamed pub-from-priv (previous_repo stripped!)
+    // 3: renamed pub-renamed (previous_repo = pub-created)
+    // 4: catalog_updated (pub-renamed -> priv-after-pub, redacted!)
+    // 5: retired pub-from-priv (DELETE)
+    // 6: unarchived pub-from-priv
+    // 7: deleted pub-from-priv
+    // 8: discovered pub-push
+    // 9: discovered refreshed-pub
+    // 10: created pub-404-gone
+    // 11: created pub-redirect-old
+    // 12: retired pub-404-gone
+    // 13: retired pub-redirect-old
+    // 14: pruned mixed (filtered strictly to pub-push, pruned_count = 1!)
+    let anon_acc = read_until_count(&mut anon_stream, "repos_changed", 14).await;
+    for private_repo in [
+        "priv-created",
+        "priv-renamed",
+        "priv-after-pub",
+        "priv-push",
+        "priv-404-gone",
+        "priv-batch-prune",
+    ] {
+        assert!(
+            !anon_acc.contains(private_repo),
+            "unexpected private repository identifier in anonymous SSE stream"
+        );
+    }
+    let anon_events = all_frame_data(&anon_acc, "repos_changed");
+    assert_eq!(anon_events.len(), 14);
+
+    let mut anon_prev_rev = 0;
+    for ev in &anon_events {
+        let rev = ev["fabric_rev"].as_u64().unwrap();
+        assert!(
+            rev > anon_prev_rev,
+            "non-monotonic fabric_rev in anon: {ev}"
+        );
+        anon_prev_rev = rev;
+    }
+
+    assert_eq!(anon_events[0]["reason"], "created");
+    assert_eq!(anon_events[0]["repo"], "pub-created");
+    assert_eq!(anon_events[1]["reason"], "renamed");
+    assert_eq!(anon_events[1]["repo"], "pub-from-priv");
+    assert!(anon_events[1].get("previous_repo").is_none());
+    assert_eq!(anon_events[2]["reason"], "renamed");
+    assert_eq!(anon_events[2]["repo"], "pub-renamed");
+    assert_eq!(anon_events[2]["previous_repo"], "pub-created");
+    assert_eq!(anon_events[3]["reason"], "catalog_updated");
+    assert!(anon_events[3].get("repo").is_none());
+    assert!(anon_events[3].get("previous_repo").is_none());
+    assert_eq!(anon_events[4]["reason"], "retired");
+    assert_eq!(anon_events[4]["repo"], "pub-from-priv");
+    assert_eq!(anon_events[5]["reason"], "unarchived");
+    assert_eq!(anon_events[6]["reason"], "deleted");
+    assert_eq!(anon_events[7]["reason"], "discovered");
+    assert_eq!(anon_events[7]["repo"], "pub-push");
+    assert_eq!(anon_events[8]["reason"], "discovered");
+    assert_eq!(anon_events[8]["repo"], "refreshed-pub");
+    assert_eq!(anon_events[11]["reason"], "retired");
+    assert_eq!(anon_events[11]["repo"], "pub-404-gone");
+    assert_eq!(anon_events[12]["reason"], "retired");
+    assert_eq!(anon_events[12]["repo"], "pub-redirect-old");
+    assert_eq!(anon_events[13]["reason"], "pruned");
+    assert_eq!(anon_events[13]["pruned_count"], 1);
+    assert_eq!(anon_events[13]["repos"], json!(["LMA1980/pub-push"]));
+}
